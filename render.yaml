@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: pizza-please-inventory-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SHEET_WRITER_URL
+        sync: false
+      - key: SHEET_SECRET
+        sync: false
+      - key: OWNER_CHAT_ID
+        value: "5766630052"
