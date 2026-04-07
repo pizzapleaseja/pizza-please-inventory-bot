@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.2
-// With ingredient + drink review screens before final submit
+// PIZZA PLEASE — INVENTORY BOT v1.3
+// With message queue to prevent race conditions
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -41,6 +41,33 @@ const submissions  = {};
 const itemCache    = {};
 const processed    = new Set();
 let weekComplete   = false;
+
+// ── Per-chat message queue ────────────────────────────────────
+// Ensures messages from the same chat are always processed
+// one at a time, in order, never in parallel.
+const queues     = {}; // chatId → array of message objects
+const processing = {}; // chatId → true while processing
+
+async function enqueue(chatId, msg, type) {
+  if (!queues[chatId]) queues[chatId] = [];
+  queues[chatId].push({ msg, type });
+  if (!processing[chatId]) await drainQueue(chatId);
+}
+
+async function drainQueue(chatId) {
+  if (processing[chatId]) return;
+  processing[chatId] = true;
+  while (queues[chatId] && queues[chatId].length > 0) {
+    const { msg, type } = queues[chatId].shift();
+    try {
+      if (type === 'message')  await handleMessage(msg);
+      if (type === 'callback') await handleCallback(msg);
+    } catch (e) {
+      console.error('Queue processing error:', e);
+    }
+  }
+  processing[chatId] = false;
+}
 
 // ── Helpers ───────────────────────────────────────────────────
 function getStore(from, chatId) {
@@ -119,7 +146,6 @@ async function askNextItem(chatId, session) {
       const tot  = items.ingredients.length;
       await send(chatId, `📦 *${item.name}* (${n}/${tot})\nHow many *${item.uom}* do you have?`);
     } else {
-      // All ingredients entered — show review screen
       await showReview(chatId, session, 'ingredients');
     }
   } else if (session.phase === 'drinks') {
@@ -129,7 +155,6 @@ async function askNextItem(chatId, session) {
       const tot  = items.drinks.length;
       await send(chatId, `🥤 *${item.name}* (${n}/${tot})\nHow many *${item.uom}* do you have?`);
     } else {
-      // All drinks entered — show review screen
       await showReview(chatId, session, 'drinks');
     }
   }
@@ -152,12 +177,11 @@ async function showReview(chatId, session, type) {
   const label = type === 'ingredients' ? 'Ingredients' : 'Drinks';
 
   let msg = `${emoji} *${label} Review — ${STORE_NAMES[session.store]}*\n`;
-  msg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+  msg    += `━━━━━━━━━━━━━━━━━━━━━━\n`;
 
   for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const val  = answers[i] !== undefined ? answers[i] : '—';
-    msg += `*${i + 1}.* ${item.name}: *${val}* ${item.uom}\n`;
+    const val = answers[i] !== undefined ? answers[i] : '—';
+    msg += `*${i + 1}.* ${items[i].name}: *${val}* ${items[i].uom}\n`;
   }
 
   msg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -171,7 +195,7 @@ async function showReview(chatId, session, type) {
   ]);
 }
 
-// ── Handle answer ─────────────────────────────────────────────
+// ── Handle numeric answer ─────────────────────────────────────
 async function handleAnswer(chatId, session, text) {
   const value = parseFloat(text.replace(/,/g, ''));
 
@@ -180,55 +204,42 @@ async function handleAnswer(chatId, session, text) {
     return;
   }
 
-  if (session.writing) return; // Silent ignore if still writing
+  const type         = session.phase; // 'ingredients' or 'drinks'
+  const indexToWrite = session.itemIndex;
 
-  const indexBeforeWrite = session.itemIndex;
-  session.writing        = true;
-  sessions[chatId]       = session;
+  const result = await callSheetWriter({
+    action:   'writeCount',
+    store:    session.store,
+    type:     type === 'ingredients' ? 'ingredient' : 'drink',
+    rowIndex: indexToWrite,
+    value:    value,
+  });
 
-  try {
-    const type   = session.phase; // 'ingredients' or 'drinks'
-    const result = await callSheetWriter({
-      action:   'writeCount',
-      store:    session.store,
-      type:     type === 'ingredients' ? 'ingredient' : 'drink',
-      rowIndex: indexBeforeWrite,
-      value:    value,
-    });
-
-    if (!result.ok) {
-      session.writing  = false;
-      sessions[chatId] = session;
-      await send(chatId, `⚠️ Error saving count: ${result.error}. Please try again.`);
-      return;
-    }
-
-    // Store answer in session for review screen
-    if (type === 'ingredients') {
-      session.answers.ingredients[indexBeforeWrite] = value;
-    } else {
-      session.answers.drinks[indexBeforeWrite] = value;
-    }
-
-    if (session.itemIndex === indexBeforeWrite) session.itemIndex++;
-    session.writing  = false;
-    sessions[chatId] = session;
-    await askNextItem(chatId, session);
-
-  } catch (err) {
-    session.writing  = false;
-    sessions[chatId] = session;
-    await send(chatId, `⚠️ Error saving. Please try again.\n_${err.message}_`);
+  if (!result.ok) {
+    await send(chatId, `⚠️ Error saving count: ${result.error}. Please try again.`);
+    return;
   }
+
+  // Store answer for review screen
+  if (type === 'ingredients') {
+    session.answers.ingredients[indexToWrite] = value;
+  } else {
+    session.answers.drinks[indexToWrite] = value;
+  }
+
+  session.itemIndex++;
+  sessions[chatId] = session;
+  await askNextItem(chatId, session);
 }
 
 // ── Handle edit during review ─────────────────────────────────
 async function handleReviewEdit(chatId, session, text) {
-  const items = session.phase === 'review_ingredients'
+  const type  = session.phase === 'review_ingredients' ? 'ingredients' : 'drinks';
+  const items = type === 'ingredients'
     ? itemCache[session.store].ingredients
     : itemCache[session.store].drinks;
 
-  // If waiting for a new value after selecting an item number
+  // Waiting for corrected value after staff selected an item number
   if (session.editing !== null) {
     const value = parseFloat(text.replace(/,/g, ''));
     if (isNaN(value) || value < 0) {
@@ -237,9 +248,7 @@ async function handleReviewEdit(chatId, session, text) {
     }
 
     const editIndex = session.editing;
-    const type      = session.phase === 'review_ingredients' ? 'ingredients' : 'drinks';
 
-    // Write corrected value to sheet
     const result = await callSheetWriter({
       action:   'writeCount',
       store:    session.store,
@@ -253,7 +262,6 @@ async function handleReviewEdit(chatId, session, text) {
       return;
     }
 
-    // Update stored answer
     if (type === 'ingredients') {
       session.answers.ingredients[editIndex] = value;
     } else {
@@ -267,25 +275,27 @@ async function handleReviewEdit(chatId, session, text) {
     return;
   }
 
-  // Otherwise expect an item number to edit
+  // Expecting an item number to edit
   const num = parseInt(text);
   if (isNaN(num) || num < 1 || num > items.length) {
     await send(chatId,
-      `⚠️ Please enter a number between *1* and *${items.length}* to select an item to edit.\n` +
+      `⚠️ Please enter a number between *1* and *${items.length}* to select an item.\n` +
       `Or tap ✅ Confirm to proceed.`
     );
     return;
   }
 
-  session.editing  = num - 1; // 0-based index
+  session.editing  = num - 1;
   sessions[chatId] = session;
-  const item = items[num - 1];
+  const answers    = type === 'ingredients' ? session.answers.ingredients : session.answers.drinks;
   await send(chatId,
-    `✏️ Editing *${item.name}*\nCurrent value: *${session.phase === 'review_ingredients' ? session.answers.ingredients[num-1] : session.answers.drinks[num-1]}* ${item.uom}\n\nEnter the correct number:`
+    `✏️ Editing *${items[num - 1].name}*\n` +
+    `Current value: *${answers[num - 1] !== undefined ? answers[num - 1] : '—'}* ${items[num - 1].uom}\n\n` +
+    `Enter the correct number:`
   );
 }
 
-// ── Finish full submission ────────────────────────────────────
+// ── Finish submission ─────────────────────────────────────────
 async function finishSubmission(chatId, session) {
   session.phase    = 'done';
   sessions[chatId] = session;
@@ -355,7 +365,7 @@ async function generateSupplierOrders() {
       }
 
       if (contact.includes('whatsapp') || contact.includes('both')) {
-        const waMsg = `📋 *Order — ${supplierName}*${label}\n\n${msg.text}`;
+        const waMsg         = `📋 *Order — ${supplierName}*${label}\n\n${msg.text}`;
         const villageChatId = knownChatIds['village'];
         if (villageChatId) await send(villageChatId, waMsg);
         await send(OWNER_ID, waMsg);
@@ -471,41 +481,16 @@ app.post('/webhook', async (req, res) => {
   if (processed.size > 1000) {
     [...processed].slice(0, 500).forEach(id => processed.delete(id));
   }
-  if (update.message)        await handleMessage(update.message);
-  if (update.callback_query) await handleCallback(update.callback_query);
+
+  if (update.message) {
+    const chatId = String(update.message.chat.id);
+    await enqueue(chatId, update.message, 'message');
+  }
+  if (update.callback_query) {
+    const chatId = String(update.callback_query.message.chat.id);
+    await enqueue(chatId, update.callback_query, 'callback');
+  }
 });
-
-// ── Callback handler (Confirm buttons) ───────────────────────
-async function handleCallback(query) {
-  const chatId = String(query.message.chat.id);
-  const data   = query.data;
-  const store  = getStore(query.from, chatId);
-
-  await answerCb(query.id);
-  if (!store) return;
-
-  const session = sessions[chatId];
-  if (!session) return;
-
-  if (data === 'CONFIRM_INGREDIENTS') {
-    // Move to drinks phase
-    session.phase     = 'drinks';
-    session.itemIndex = 0;
-    sessions[chatId]  = session;
-    await send(chatId,
-      `✅ *Ingredients confirmed!* Now let's do the drinks. 🥤\n\n` +
-      `${itemCache[session.store].drinks.length} items to go.`
-    );
-    await askNextItem(chatId, session);
-    return;
-  }
-
-  if (data === 'CONFIRM_DRINKS') {
-    // All done — finish submission
-    await finishSubmission(chatId, session);
-    return;
-  }
-}
 
 // ── Message handler ───────────────────────────────────────────
 async function handleMessage(msg) {
@@ -545,7 +530,6 @@ async function handleMessage(msg) {
         store,
         phase:     'ingredients',
         itemIndex: 0,
-        writing:   false,
         editing:   null,
         answers:   { ingredients: [], drinks: [] },
       };
@@ -554,7 +538,7 @@ async function handleMessage(msg) {
         `I'll ask you for each item one by one.\n` +
         `📦 *Ingredients:* ${items.ingredients.length} items\n` +
         `🥤 *Drinks:* ${items.drinks.length} items\n\n` +
-        `You'll get a review screen after each section to check and fix any mistakes.\n\n` +
+        `You'll get a review screen after each section to check your answers.\n\n` +
         `_(Type *RESTART* at any time to start over)_\n\nStarting now!`
       );
       await askNextItem(chatId, sessions[chatId]);
@@ -589,11 +573,40 @@ async function handleMessage(msg) {
     return;
   }
 
-  // Route to correct handler based on phase
   if (session.phase === 'ingredients' || session.phase === 'drinks') {
     await handleAnswer(chatId, session, text);
   } else if (session.phase === 'review_ingredients' || session.phase === 'review_drinks') {
     await handleReviewEdit(chatId, session, text);
+  }
+}
+
+// ── Callback handler ──────────────────────────────────────────
+async function handleCallback(query) {
+  const chatId = String(query.message.chat.id);
+  const data   = query.data;
+  const store  = getStore(query.from, chatId);
+
+  await answerCb(query.id);
+  if (!store) return;
+
+  const session = sessions[chatId];
+  if (!session) return;
+
+  if (data === 'CONFIRM_INGREDIENTS') {
+    session.phase     = 'drinks';
+    session.itemIndex = 0;
+    sessions[chatId]  = session;
+    await send(chatId,
+      `✅ *Ingredients confirmed!* Now let's do the drinks. 🥤\n\n` +
+      `${itemCache[session.store].drinks.length} items to go.`
+    );
+    await askNextItem(chatId, session);
+    return;
+  }
+
+  if (data === 'CONFIRM_DRINKS') {
+    await finishSubmission(chatId, session);
+    return;
   }
 }
 
