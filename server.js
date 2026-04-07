@@ -1,5 +1,5 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1
+// PIZZA PLEASE — INVENTORY BOT v1.1
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -95,7 +95,9 @@ async function askNextItem(chatId, session) {
     } else {
       session.phase     = 'drinks';
       session.itemIndex = 0;
-      await send(chatId, `✅ *Ingredients done!* Now let's do the drinks. 🥤\n\n${items.drinks.length} items to go.`);
+      await send(chatId,
+        `✅ *Ingredients done!* Now let's do the drinks. 🥤\n\n${items.drinks.length} items to go.`
+      );
       await askNextItem(chatId, session);
     }
   } else if (session.phase === 'drinks') {
@@ -110,29 +112,52 @@ async function askNextItem(chatId, session) {
   }
 }
 
+// ── Handle answer — with write lock to prevent double-processing ──
 async function handleAnswer(chatId, session, text) {
   const value = parseFloat(text.replace(/,/g, ''));
+
   if (isNaN(value) || value < 0) {
     await send(chatId, `⚠️ Please enter a number only. Try again:`);
     return;
   }
 
-  const result = await callSheetWriter({
-    action:   'writeCount',
-    store:    session.store,
-    type:     session.phase === 'ingredients' ? 'ingredient' : 'drink',
-    rowIndex: session.itemIndex,
-    value:    value,
-  });
-
-  if (!result.ok) {
-    await send(chatId, `⚠️ Error saving count: ${result.error}. Please try again.`);
+  // If sheet write is still in progress, ask user to wait
+  if (session.writing) {
+    await send(chatId, `⏳ Still saving your last answer, please wait a moment and try again.`);
     return;
   }
 
-  session.itemIndex++;
+  // Lock session while writing
+  session.writing  = true;
   sessions[chatId] = session;
-  await askNextItem(chatId, session);
+
+  try {
+    const result = await callSheetWriter({
+      action:   'writeCount',
+      store:    session.store,
+      type:     session.phase === 'ingredients' ? 'ingredient' : 'drink',
+      rowIndex: session.itemIndex,
+      value:    value,
+    });
+
+    if (!result.ok) {
+      session.writing  = false;
+      sessions[chatId] = session;
+      await send(chatId, `⚠️ Error saving count: ${result.error}. Please try again.`);
+      return;
+    }
+
+    // Write confirmed — advance to next item
+    session.itemIndex++;
+    session.writing  = false;
+    sessions[chatId] = session;
+    await askNextItem(chatId, session);
+
+  } catch (err) {
+    session.writing  = false;
+    sessions[chatId] = session;
+    await send(chatId, `⚠️ Error saving count. Please try again.\n_${err.message}_`);
+  }
 }
 
 async function finishSubmission(chatId, session) {
@@ -194,7 +219,9 @@ async function generateSupplierOrders() {
           subject: `Order Request — ${supplierName}${label} — ${dateStr}`,
           body:    msg.text,
         });
-        await send(OWNER_ID, `📧 Email draft created for *${supplierName}*${label}\n_Check pizzapleaseordering@gmail.com drafts_`);
+        await send(OWNER_ID,
+          `📧 Email draft created for *${supplierName}*${label}\n_Check pizzapleaseordering@gmail.com drafts_`
+        );
         emailCount++;
       }
 
@@ -323,7 +350,9 @@ async function handleMessage(msg) {
   if (!store) {
     const username = msg.from && msg.from.username ? '@' + msg.from.username : 'no username';
     const name     = msg.from && msg.from.first_name ? msg.from.first_name : 'Unknown';
-    await send(OWNER_ID, `⚠️ *Unauthorised access attempt*\nName: ${name}\nUsername: ${username}\nChat ID: ${chatId}`);
+    await send(OWNER_ID,
+      `⚠️ *Unauthorised access attempt*\nName: ${name}\nUsername: ${username}\nChat ID: ${chatId}`
+    );
     await send(chatId, `Sorry, you are not authorised to use this bot.`);
     return;
   }
@@ -331,7 +360,9 @@ async function handleMessage(msg) {
   if (!knownChatIds[store]) {
     knownChatIds[store] = chatId;
     console.log(`Registered chat ID for ${STORE_NAMES[store]}: ${chatId}`);
-    await send(OWNER_ID, `📌 *${STORE_NAMES[store]}* registered on the inventory bot.\n_Chat ID: ${chatId}_`);
+    await send(OWNER_ID,
+      `📌 *${STORE_NAMES[store]}* registered on the inventory bot.\n_Chat ID: ${chatId}_`
+    );
   }
 
   const upper = text.toUpperCase();
@@ -344,7 +375,7 @@ async function handleMessage(msg) {
     try {
       await send(chatId, `Loading your item list... ⏳`);
       const items = await loadItems(store);
-      sessions[chatId] = { store, phase: 'ingredients', itemIndex: 0 };
+      sessions[chatId] = { store, phase: 'ingredients', itemIndex: 0, writing: false };
       await send(chatId,
         `Let's go! 📋\n\n` +
         `I'll ask you for each item one by one.\n` +
