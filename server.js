@@ -1,5 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.1
+// PIZZA PLEASE — INVENTORY BOT v1.2
+// With ingredient + drink review screens before final submit
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -41,6 +42,7 @@ const itemCache    = {};
 const processed    = new Set();
 let weekComplete   = false;
 
+// ── Helpers ───────────────────────────────────────────────────
 function getStore(from, chatId) {
   chatId = String(chatId);
   if (chatId === OWNER_ID) return 'village';
@@ -58,12 +60,34 @@ function pendingStores() {
   return Object.keys(STORE_NAMES).filter(s => !submissions[s]);
 }
 
+// ── Telegram API ──────────────────────────────────────────────
 async function send(chatId, text) {
   await fetch(`${BASE_URL}/sendMessage`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' }),
   }).catch(e => console.error('send error:', e));
+}
+
+async function sendKb(chatId, text, keyboard) {
+  await fetch(`${BASE_URL}/sendMessage`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      chat_id:      chatId,
+      text,
+      parse_mode:   'Markdown',
+      reply_markup: { inline_keyboard: keyboard },
+    }),
+  }).catch(e => console.error('sendKb error:', e));
+}
+
+async function answerCb(queryId) {
+  await fetch(`${BASE_URL}/answerCallbackQuery`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ callback_query_id: queryId }),
+  }).catch(() => {});
 }
 
 async function callSheetWriter(payload) {
@@ -75,6 +99,7 @@ async function callSheetWriter(payload) {
   return res.json();
 }
 
+// ── Load items ────────────────────────────────────────────────
 async function loadItems(store) {
   if (itemCache[store]) return itemCache[store];
   const result = await callSheetWriter({ action: 'getItems', store });
@@ -83,6 +108,7 @@ async function loadItems(store) {
   return itemCache[store];
 }
 
+// ── Ask next item ─────────────────────────────────────────────
 async function askNextItem(chatId, session) {
   const items = itemCache[session.store];
 
@@ -93,12 +119,8 @@ async function askNextItem(chatId, session) {
       const tot  = items.ingredients.length;
       await send(chatId, `📦 *${item.name}* (${n}/${tot})\nHow many *${item.uom}* do you have?`);
     } else {
-      session.phase     = 'drinks';
-      session.itemIndex = 0;
-      await send(chatId,
-        `✅ *Ingredients done!* Now let's do the drinks. 🥤\n\n${items.drinks.length} items to go.`
-      );
-      await askNextItem(chatId, session);
+      // All ingredients entered — show review screen
+      await showReview(chatId, session, 'ingredients');
     }
   } else if (session.phase === 'drinks') {
     if (session.itemIndex < items.drinks.length) {
@@ -107,12 +129,49 @@ async function askNextItem(chatId, session) {
       const tot  = items.drinks.length;
       await send(chatId, `🥤 *${item.name}* (${n}/${tot})\nHow many *${item.uom}* do you have?`);
     } else {
-      await finishSubmission(chatId, session);
+      // All drinks entered — show review screen
+      await showReview(chatId, session, 'drinks');
     }
   }
 }
 
-// ── Handle answer — with write lock to prevent double-processing ──
+// ── Show review screen ────────────────────────────────────────
+async function showReview(chatId, session, type) {
+  session.phase    = type === 'ingredients' ? 'review_ingredients' : 'review_drinks';
+  session.editing  = null;
+  sessions[chatId] = session;
+
+  const items   = type === 'ingredients'
+    ? itemCache[session.store].ingredients
+    : itemCache[session.store].drinks;
+  const answers = type === 'ingredients'
+    ? session.answers.ingredients
+    : session.answers.drinks;
+
+  const emoji = type === 'ingredients' ? '📦' : '🥤';
+  const label = type === 'ingredients' ? 'Ingredients' : 'Drinks';
+
+  let msg = `${emoji} *${label} Review — ${STORE_NAMES[session.store]}*\n`;
+  msg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const val  = answers[i] !== undefined ? answers[i] : '—';
+    msg += `*${i + 1}.* ${item.name}: *${val}* ${item.uom}\n`;
+  }
+
+  msg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `To edit an item, type its *number* (e.g. type *3* to edit item 3).\n`;
+  msg += type === 'ingredients'
+    ? `When ready, tap ✅ *Confirm* to proceed to drinks.`
+    : `When ready, tap ✅ *Confirm* to submit your inventory.`;
+
+  await sendKb(chatId, msg, [
+    [{ text: `✅ Confirm ${label}`, callback_data: `CONFIRM_${type.toUpperCase()}` }]
+  ]);
+}
+
+// ── Handle answer ─────────────────────────────────────────────
 async function handleAnswer(chatId, session, text) {
   const value = parseFloat(text.replace(/,/g, ''));
 
@@ -121,22 +180,19 @@ async function handleAnswer(chatId, session, text) {
     return;
   }
 
-  // If sheet write is still in progress, ask user to wait
-  if (session.writing) {
-    await send(chatId, `⏳ Still saving your last answer, please wait a moment and try again.`);
-    return;
-  }
+  if (session.writing) return; // Silent ignore if still writing
 
-  // Lock session while writing
-  session.writing  = true;
-  sessions[chatId] = session;
+  const indexBeforeWrite = session.itemIndex;
+  session.writing        = true;
+  sessions[chatId]       = session;
 
   try {
+    const type   = session.phase; // 'ingredients' or 'drinks'
     const result = await callSheetWriter({
       action:   'writeCount',
       store:    session.store,
-      type:     session.phase === 'ingredients' ? 'ingredient' : 'drink',
-      rowIndex: session.itemIndex,
+      type:     type === 'ingredients' ? 'ingredient' : 'drink',
+      rowIndex: indexBeforeWrite,
       value:    value,
     });
 
@@ -147,8 +203,14 @@ async function handleAnswer(chatId, session, text) {
       return;
     }
 
-    // Write confirmed — advance to next item
-    session.itemIndex++;
+    // Store answer in session for review screen
+    if (type === 'ingredients') {
+      session.answers.ingredients[indexBeforeWrite] = value;
+    } else {
+      session.answers.drinks[indexBeforeWrite] = value;
+    }
+
+    if (session.itemIndex === indexBeforeWrite) session.itemIndex++;
     session.writing  = false;
     sessions[chatId] = session;
     await askNextItem(chatId, session);
@@ -156,10 +218,74 @@ async function handleAnswer(chatId, session, text) {
   } catch (err) {
     session.writing  = false;
     sessions[chatId] = session;
-    await send(chatId, `⚠️ Error saving count. Please try again.\n_${err.message}_`);
+    await send(chatId, `⚠️ Error saving. Please try again.\n_${err.message}_`);
   }
 }
 
+// ── Handle edit during review ─────────────────────────────────
+async function handleReviewEdit(chatId, session, text) {
+  const items = session.phase === 'review_ingredients'
+    ? itemCache[session.store].ingredients
+    : itemCache[session.store].drinks;
+
+  // If waiting for a new value after selecting an item number
+  if (session.editing !== null) {
+    const value = parseFloat(text.replace(/,/g, ''));
+    if (isNaN(value) || value < 0) {
+      await send(chatId, `⚠️ Please enter a valid number for *${items[session.editing].name}*:`);
+      return;
+    }
+
+    const editIndex = session.editing;
+    const type      = session.phase === 'review_ingredients' ? 'ingredients' : 'drinks';
+
+    // Write corrected value to sheet
+    const result = await callSheetWriter({
+      action:   'writeCount',
+      store:    session.store,
+      type:     type === 'ingredients' ? 'ingredient' : 'drink',
+      rowIndex: editIndex,
+      value:    value,
+    });
+
+    if (!result.ok) {
+      await send(chatId, `⚠️ Error saving: ${result.error}. Please try again.`);
+      return;
+    }
+
+    // Update stored answer
+    if (type === 'ingredients') {
+      session.answers.ingredients[editIndex] = value;
+    } else {
+      session.answers.drinks[editIndex] = value;
+    }
+
+    session.editing  = null;
+    sessions[chatId] = session;
+    await send(chatId, `✅ *${items[editIndex].name}* updated to *${value}*`);
+    await showReview(chatId, session, type);
+    return;
+  }
+
+  // Otherwise expect an item number to edit
+  const num = parseInt(text);
+  if (isNaN(num) || num < 1 || num > items.length) {
+    await send(chatId,
+      `⚠️ Please enter a number between *1* and *${items.length}* to select an item to edit.\n` +
+      `Or tap ✅ Confirm to proceed.`
+    );
+    return;
+  }
+
+  session.editing  = num - 1; // 0-based index
+  sessions[chatId] = session;
+  const item = items[num - 1];
+  await send(chatId,
+    `✏️ Editing *${item.name}*\nCurrent value: *${session.phase === 'review_ingredients' ? session.answers.ingredients[num-1] : session.answers.drinks[num-1]}* ${item.uom}\n\nEnter the correct number:`
+  );
+}
+
+// ── Finish full submission ────────────────────────────────────
 async function finishSubmission(chatId, session) {
   session.phase    = 'done';
   sessions[chatId] = session;
@@ -170,7 +296,9 @@ async function finishSubmission(chatId, session) {
 
   submissions[store] = true;
 
-  await send(chatId, `✅ *${storeName} inventory submitted!*\n\nThank you! All your counts have been recorded. 🙏`);
+  await send(chatId,
+    `✅ *${storeName} inventory submitted!*\n\nThank you! All your counts have been recorded. 🙏`
+  );
 
   const pending = pendingStores();
 
@@ -190,6 +318,7 @@ async function finishSubmission(chatId, session) {
   }
 }
 
+// ── Supplier orders ───────────────────────────────────────────
 async function generateSupplierOrders() {
   const result = await callSheetWriter({ action: 'getOrderData' });
   if (!result.ok) {
@@ -242,6 +371,7 @@ async function generateSupplierOrders() {
   );
 }
 
+// ── Build order messages ──────────────────────────────────────
 function buildOrderMessages(supplier, delivery, dateStr) {
   const items  = supplier.items;
   const name   = supplier.name;
@@ -306,6 +436,7 @@ function buildOrderMessages(supplier, delivery, dateStr) {
   return [{ text: body, label: '' }];
 }
 
+// ── Monday prompt ─────────────────────────────────────────────
 async function sendMondayPrompt() {
   weekComplete = false;
   Object.keys(submissions).forEach(k => delete submissions[k]);
@@ -323,13 +454,14 @@ async function sendMondayPrompt() {
   }
 
   const missing = Object.keys(STORE_NAMES).filter(s => !knownChatIds[s]);
-  let ownerMsg = `📋 Monday inventory prompt sent to ${sent} store(s).`;
+  let ownerMsg  = `📋 Monday inventory prompt sent to ${sent} store(s).`;
   if (missing.length > 0) {
-    ownerMsg += `\n⚠️ Could not reach: *${missing.map(s => STORE_NAMES[s]).join(', ')}* — they haven't messaged the bot yet.`;
+    ownerMsg += `\n⚠️ Could not reach: *${missing.map(s => STORE_NAMES[s]).join(', ')}*`;
   }
   await send(OWNER_ID, ownerMsg);
 }
 
+// ── Webhook ───────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -339,9 +471,43 @@ app.post('/webhook', async (req, res) => {
   if (processed.size > 1000) {
     [...processed].slice(0, 500).forEach(id => processed.delete(id));
   }
-  if (update.message) await handleMessage(update.message);
+  if (update.message)        await handleMessage(update.message);
+  if (update.callback_query) await handleCallback(update.callback_query);
 });
 
+// ── Callback handler (Confirm buttons) ───────────────────────
+async function handleCallback(query) {
+  const chatId = String(query.message.chat.id);
+  const data   = query.data;
+  const store  = getStore(query.from, chatId);
+
+  await answerCb(query.id);
+  if (!store) return;
+
+  const session = sessions[chatId];
+  if (!session) return;
+
+  if (data === 'CONFIRM_INGREDIENTS') {
+    // Move to drinks phase
+    session.phase     = 'drinks';
+    session.itemIndex = 0;
+    sessions[chatId]  = session;
+    await send(chatId,
+      `✅ *Ingredients confirmed!* Now let's do the drinks. 🥤\n\n` +
+      `${itemCache[session.store].drinks.length} items to go.`
+    );
+    await askNextItem(chatId, session);
+    return;
+  }
+
+  if (data === 'CONFIRM_DRINKS') {
+    // All done — finish submission
+    await finishSubmission(chatId, session);
+    return;
+  }
+}
+
+// ── Message handler ───────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = String(msg.chat.id);
   const text   = (msg.text || '').trim();
@@ -359,7 +525,7 @@ async function handleMessage(msg) {
 
   if (!knownChatIds[store]) {
     knownChatIds[store] = chatId;
-    console.log(`Registered chat ID for ${STORE_NAMES[store]}: ${chatId}`);
+    console.log(`Registered ${STORE_NAMES[store]}: ${chatId}`);
     await send(OWNER_ID,
       `📌 *${STORE_NAMES[store]}* registered on the inventory bot.\n_Chat ID: ${chatId}_`
     );
@@ -369,19 +535,26 @@ async function handleMessage(msg) {
 
   if (upper === 'START') {
     if (sessions[chatId] && sessions[chatId].phase === 'done') {
-      await send(chatId, `✅ You have already submitted this week.\nType *RESTART* if you need to redo it.`);
+      await send(chatId, `✅ Already submitted this week. Type *RESTART* to redo.`);
       return;
     }
     try {
       await send(chatId, `Loading your item list... ⏳`);
       const items = await loadItems(store);
-      sessions[chatId] = { store, phase: 'ingredients', itemIndex: 0, writing: false };
+      sessions[chatId] = {
+        store,
+        phase:     'ingredients',
+        itemIndex: 0,
+        writing:   false,
+        editing:   null,
+        answers:   { ingredients: [], drinks: [] },
+      };
       await send(chatId,
         `Let's go! 📋\n\n` +
         `I'll ask you for each item one by one.\n` +
         `📦 *Ingredients:* ${items.ingredients.length} items\n` +
         `🥤 *Drinks:* ${items.drinks.length} items\n\n` +
-        `Just type the number when asked.\n` +
+        `You'll get a review screen after each section to check and fix any mistakes.\n\n` +
         `_(Type *RESTART* at any time to start over)_\n\nStarting now!`
       );
       await askNextItem(chatId, sessions[chatId]);
@@ -410,14 +583,21 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (sessions[chatId] && sessions[chatId].phase !== 'done') {
-    await handleAnswer(chatId, sessions[chatId], text);
+  const session = sessions[chatId];
+  if (!session || session.phase === 'done') {
+    await send(chatId, `Type *START* to begin your inventory submission.`);
     return;
   }
 
-  await send(chatId, `Type *START* to begin your inventory submission.`);
+  // Route to correct handler based on phase
+  if (session.phase === 'ingredients' || session.phase === 'drinks') {
+    await handleAnswer(chatId, session, text);
+  } else if (session.phase === 'review_ingredients' || session.phase === 'review_drinks') {
+    await handleReviewEdit(chatId, session, text);
+  }
 }
 
+// ── Utility endpoints ─────────────────────────────────────────
 app.get('/', (req, res) => res.send('Pizza Please Inventory Bot — running ✅'));
 
 app.get('/prompt', async (req, res) => {
