@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.4
-// With message queue + review screens + simulate endpoint
+// PIZZA PLEASE — INVENTORY BOT v1.5
+// With text-based order quantities from ORD TOT tab
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -332,6 +332,11 @@ async function generateSupplierOrders() {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
   });
 
+  if (Object.keys(suppliers).length === 0) {
+    await send(OWNER_ID, `⚠️ No supplier orders found in ORD TOT tab. Check that order quantities are filled in.`);
+    return;
+  }
+
   let emailCount    = 0;
   let whatsappCount = 0;
 
@@ -372,7 +377,7 @@ async function generateSupplierOrders() {
   );
 }
 
-// ── Build order messages ──────────────────────────────────────
+// ── Build order messages (text quantities) ────────────────────
 function buildOrderMessages(supplier, delivery, dateStr) {
   const items  = supplier.items;
   const name   = supplier.name;
@@ -382,10 +387,10 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     let body = header + `Please prepare the following order for direct delivery to each location:\n\n`;
     for (const item of items) {
       body += `${item.name}:\n`;
-      if (item.village > 0) body += `  Village Plaza:  ${item.village}\n`;
-      if (item.wf      > 0) body += `  Waterfront:     ${item.wf}\n`;
-      if (item.lig     > 0) body += `  Liguanea:       ${item.lig}\n`;
-      if (item.ochi    > 0) body += `  Ocho Rios:      ${item.ochi}\n`;
+      if (item.village) body += `  Village Plaza:  ${item.village}\n`;
+      if (item.wf)      body += `  Waterfront:     ${item.wf}\n`;
+      if (item.lig)     body += `  Liguanea:       ${item.lig}\n`;
+      if (item.ochi)    body += `  Ocho Rios:      ${item.ochi}\n`;
       body += '\n';
     }
     body += 'Thank you!';
@@ -394,33 +399,28 @@ function buildOrderMessages(supplier, delivery, dateStr) {
 
   if (delivery.includes('village')) {
     const messages    = [];
-    const hasOchi     = items.some(i => i.ochi > 0);
-    const hasKingston = items.some(i => (i.village + i.wf + i.lig) > 0);
+    const hasOchi     = items.some(i => i.ochi !== '');
+    const hasKingston = items.some(i => i.village !== '' || i.wf !== '' || i.lig !== '');
 
     if (hasKingston) {
-      let body = header + `Please prepare the following consolidated order for delivery to Village Plaza (Kingston stores):\n\n`;
+      let body = header + `Please prepare the following order for delivery to Village Plaza (Kingston stores):\n\n`;
       for (const item of items) {
-        const qty = (item.village || 0) + (item.wf || 0) + (item.lig || 0);
-        if (qty > 0) body += `${item.name}: ${qty}\n`;
-      }
-      body += `\nBreakdown by location:\n`;
-      for (const item of items) {
-        const qty = (item.village || 0) + (item.wf || 0) + (item.lig || 0);
-        if (qty > 0) {
-          body += `\n${item.name}:\n`;
-          if (item.village > 0) body += `  Village Plaza: ${item.village}\n`;
-          if (item.wf      > 0) body += `  Waterfront:    ${item.wf}\n`;
-          if (item.lig     > 0) body += `  Liguanea:      ${item.lig}\n`;
+        if (item.village || item.wf || item.lig) {
+          body += `${item.name}:\n`;
+          if (item.village) body += `  Village Plaza: ${item.village}\n`;
+          if (item.wf)      body += `  Waterfront:    ${item.wf}\n`;
+          if (item.lig)     body += `  Liguanea:      ${item.lig}\n`;
+          body += '\n';
         }
       }
-      body += '\nThank you!';
+      body += 'Thank you!';
       messages.push({ text: body, label: 'Kingston' });
     }
 
     if (hasOchi) {
       let body = header + `Please prepare the following order for delivery to Ocho Rios:\n\n`;
       for (const item of items) {
-        if (item.ochi > 0) body += `${item.name}: ${item.ochi}\n`;
+        if (item.ochi) body += `${item.name}: ${item.ochi}\n`;
       }
       body += '\nThank you!';
       messages.push({ text: body, label: 'Ocho Rios' });
@@ -429,11 +429,17 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     return messages;
   }
 
+  // Fallback
   let body = header;
   for (const item of items) {
-    if (item.total > 0) body += `${item.name}: ${item.total}\n`;
+    body += `${item.name}:\n`;
+    if (item.village) body += `  Village Plaza: ${item.village}\n`;
+    if (item.wf)      body += `  Waterfront:    ${item.wf}\n`;
+    if (item.lig)     body += `  Liguanea:      ${item.lig}\n`;
+    if (item.ochi)    body += `  Ocho Rios:     ${item.ochi}\n`;
+    body += '\n';
   }
-  body += '\nThank you!';
+  body += 'Thank you!';
   return [{ text: body, label: '' }];
 }
 
@@ -603,18 +609,14 @@ async function handleCallback(query) {
 }
 
 // ── Utility endpoints ─────────────────────────────────────────
-
-// Health check
 app.get('/', (req, res) => res.send('Pizza Please Inventory Bot — running ✅'));
 
-// Monday prompt
 app.get('/prompt', async (req, res) => {
   if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
   await sendMondayPrompt();
   res.json({ ok: true, message: 'Monday prompt sent' });
 });
 
-// Reset sessions
 app.get('/reset', (req, res) => {
   if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
   Object.keys(submissions).forEach(k => delete submissions[k]);
@@ -624,22 +626,12 @@ app.get('/reset', (req, res) => {
   res.send('Reset complete. knownChatIds preserved.');
 });
 
-// ── SIMULATE ALL STORES DONE — for testing order generation ──
-// Marks all 4 stores as submitted and fires generateSupplierOrders().
-// Hit this URL to test order generation without needing all 4 stores to submit:
-// https://pizza-please-inventory-bot.onrender.com/simulate-all-done?secret=PizzaInventory2026$
 app.get('/simulate-all-done', async (req, res) => {
   if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
-
-  // Mark all stores as submitted
   Object.keys(STORE_NAMES).forEach(s => submissions[s] = true);
   weekComplete = true;
-
   res.json({ ok: true, message: 'Simulating all stores done — generating supplier orders...' });
-
-  await send(OWNER_ID,
-    `🧪 *[TEST] Simulating all 4 stores submitted.*\nGenerating supplier orders now...`
-  );
+  await send(OWNER_ID, `🧪 *[TEST] Simulating all 4 stores submitted.*\nGenerating supplier orders now...`);
   await generateSupplierOrders();
 });
 
