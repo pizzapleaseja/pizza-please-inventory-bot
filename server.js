@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.5
-// With text-based order quantities from ORD TOT tab
+// PIZZA PLEASE — INVENTORY BOT v1.6
+// Full supplier details from Suppliers tab
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -61,7 +61,7 @@ async function drainQueue(chatId) {
       if (type === 'message')  await handleMessage(msg);
       if (type === 'callback') await handleCallback(msg);
     } catch (e) {
-      console.error('Queue processing error:', e);
+      console.error('Queue error:', e);
     }
   }
   processing[chatId] = false;
@@ -136,7 +136,6 @@ async function loadItems(store) {
 // ── Ask next item ─────────────────────────────────────────────
 async function askNextItem(chatId, session) {
   const items = itemCache[session.store];
-
   if (session.phase === 'ingredients') {
     if (session.itemIndex < items.ingredients.length) {
       const item = items.ingredients[session.itemIndex];
@@ -191,7 +190,7 @@ async function showReview(chatId, session, type) {
   ]);
 }
 
-// ── Handle numeric answer ─────────────────────────────────────
+// ── Handle answer ─────────────────────────────────────────────
 async function handleAnswer(chatId, session, text) {
   const value = parseFloat(text.replace(/,/g, ''));
   if (isNaN(value) || value < 0) {
@@ -226,7 +225,7 @@ async function handleAnswer(chatId, session, text) {
   await askNextItem(chatId, session);
 }
 
-// ── Handle edit during review ─────────────────────────────────
+// ── Handle review edit ────────────────────────────────────────
 async function handleReviewEdit(chatId, session, text) {
   const type  = session.phase === 'review_ingredients' ? 'ingredients' : 'drinks';
   const items = type === 'ingredients'
@@ -239,7 +238,6 @@ async function handleReviewEdit(chatId, session, text) {
       await send(chatId, `⚠️ Please enter a valid number for *${items[session.editing].name}*:`);
       return;
     }
-
     const editIndex = session.editing;
     const result    = await callSheetWriter({
       action:   'writeCount',
@@ -248,18 +246,15 @@ async function handleReviewEdit(chatId, session, text) {
       rowIndex: editIndex,
       value:    value,
     });
-
     if (!result.ok) {
-      await send(chatId, `⚠️ Error saving: ${result.error}. Please try again.`);
+      await send(chatId, `⚠️ Error saving: ${result.error}. Try again.`);
       return;
     }
-
     if (type === 'ingredients') {
       session.answers.ingredients[editIndex] = value;
     } else {
       session.answers.drinks[editIndex] = value;
     }
-
     session.editing  = null;
     sessions[chatId] = session;
     await send(chatId, `✅ *${items[editIndex].name}* updated to *${value}*`);
@@ -270,8 +265,7 @@ async function handleReviewEdit(chatId, session, text) {
   const num = parseInt(text);
   if (isNaN(num) || num < 1 || num > items.length) {
     await send(chatId,
-      `⚠️ Please enter a number between *1* and *${items.length}* to select an item.\n` +
-      `Or tap ✅ Confirm to proceed.`
+      `⚠️ Please enter a number between *1* and *${items.length}* to select an item.\nOr tap ✅ Confirm to proceed.`
     );
     return;
   }
@@ -294,7 +288,6 @@ async function finishSubmission(chatId, session) {
   const store     = session.store;
   const storeName = STORE_NAMES[store];
   const icon      = STORE_ICONS[store];
-
   submissions[store] = true;
 
   await send(chatId,
@@ -302,7 +295,6 @@ async function finishSubmission(chatId, session) {
   );
 
   const pending = pendingStores();
-
   if (pending.length === 0 && !weekComplete) {
     weekComplete = true;
     await send(OWNER_ID,
@@ -313,7 +305,7 @@ async function finishSubmission(chatId, session) {
     await generateSupplierOrders();
   } else {
     await send(OWNER_ID,
-      `${icon} *${storeName}* submitted inventory. ✅\n` +
+      `${icon} *${storeName}* submitted. ✅\n` +
       `⏳ Still waiting for: *${pending.map(s => STORE_NAMES[s]).join(', ')}*`
     );
   }
@@ -328,40 +320,55 @@ async function generateSupplierOrders() {
   }
 
   const suppliers = result.suppliers;
-  const dateStr   = new Date().toLocaleDateString('en-US', {
-    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
-  });
 
-  if (Object.keys(suppliers).length === 0) {
-    await send(OWNER_ID, `⚠️ No supplier orders found in ORD TOT tab. Check that order quantities are filled in.`);
+  if (!suppliers || Object.keys(suppliers).length === 0) {
+    await send(OWNER_ID,
+      `⚠️ No orders found in ORD TOT tab.\n` +
+      `Please check that order quantities are filled in columns B–E.`
+    );
     return;
   }
+
+  const dateStr = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
+  });
 
   let emailCount    = 0;
   let whatsappCount = 0;
 
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
-    const contact  = (supplier.contact  || '').toLowerCase();
-    const delivery = (supplier.delivery || '').toLowerCase();
+    const contact  = (supplier.contactMethod || '').toLowerCase();
+    const delivery = (supplier.delivery      || '').toLowerCase();
     const messages = buildOrderMessages(supplier, delivery, dateStr);
 
     for (const msg of messages) {
       const label = msg.label ? ` (${msg.label})` : '';
 
-      if (contact.includes('email') || contact.includes('both')) {
+      // ── EMAIL ──
+      if (contact.includes('email')) {
         await callSheetWriter({
           action:  'createEmailDraft',
+          to:      supplier.email || '',
           subject: `Order Request — ${supplierName}${label} — ${dateStr}`,
           body:    msg.text,
         });
         await send(OWNER_ID,
-          `📧 Email draft created for *${supplierName}*${label}\n_Check pizzapleaseordering@gmail.com drafts_`
+          `📧 Email draft created for *${supplierName}*${label}\n` +
+          `_To: ${supplier.email || 'no email on file'}_\n` +
+          `_Check pizzapleaseordering@gmail.com drafts_`
         );
         emailCount++;
       }
 
-      if (contact.includes('whatsapp') || contact.includes('both')) {
-        const waMsg         = `📋 *Order — ${supplierName}*${label}\n\n${msg.text}`;
+      // ── WHATSAPP ──
+      if (contact.includes('whatsapp')) {
+        const waHeader =
+          `📋 *Order — ${supplierName}*${label}\n` +
+          (supplier.contactName ? `_Attn: ${supplier.contactName}_\n` : '') +
+          (supplier.whatsapp    ? `_WhatsApp: ${supplier.whatsapp}_\n` : '') +
+          (supplier.deliveryDay ? `_Delivery day: ${supplier.deliveryDay}_\n` : '') +
+          `\n`;
+        const waMsg = waHeader + msg.text;
         const villageChatId = knownChatIds['village'];
         if (villageChatId) await send(villageChatId, waMsg);
         await send(OWNER_ID, waMsg);
@@ -377,70 +384,102 @@ async function generateSupplierOrders() {
   );
 }
 
-// ── Build order messages (text quantities) ────────────────────
+// ── Build order messages ──────────────────────────────────────
 function buildOrderMessages(supplier, delivery, dateStr) {
   const items  = supplier.items;
   const name   = supplier.name;
-  const header = `Pizza Please — Order Request\nSupplier: ${name}\nDate: ${dateStr}\n\n`;
+  const header =
+    `Pizza Please — Order Request\n` +
+    `Supplier: ${name}\n` +
+    `Date: ${dateStr}\n\n`;
 
+  // DIRECT TO ALL STORES — each store gets its own delivery
   if (delivery.includes('direct')) {
-    let body = header + `Please prepare the following order for direct delivery to each location:\n\n`;
-    for (const item of items) {
-      body += `${item.name}:\n`;
-      if (item.village) body += `  Village Plaza:  ${item.village}\n`;
-      if (item.wf)      body += `  Waterfront:     ${item.wf}\n`;
-      if (item.lig)     body += `  Liguanea:       ${item.lig}\n`;
-      if (item.ochi)    body += `  Ocho Rios:      ${item.ochi}\n`;
+    let body = header + `Please prepare the following order for delivery to each location:\n\n`;
+
+    // Village
+    const villageItems = items.filter(i => i.village);
+    if (villageItems.length > 0 && supplier.addrVillage) {
+      body += `📍 *Village Plaza*\n${supplier.addrVillage}\n`;
+      villageItems.forEach(i => { body += `  ${i.name}: ${i.village}\n`; });
       body += '\n';
     }
+
+    // Waterfront
+    const wfItems = items.filter(i => i.wf);
+    if (wfItems.length > 0 && supplier.addrWaterfront) {
+      body += `📍 *Waterfront*\n${supplier.addrWaterfront}\n`;
+      wfItems.forEach(i => { body += `  ${i.name}: ${i.wf}\n`; });
+      body += '\n';
+    }
+
+    // Liguanea
+    const ligItems = items.filter(i => i.lig);
+    if (ligItems.length > 0 && supplier.addrLiguanea) {
+      body += `📍 *Liguanea*\n${supplier.addrLiguanea}\n`;
+      ligItems.forEach(i => { body += `  ${i.name}: ${i.lig}\n`; });
+      body += '\n';
+    }
+
+    // Ocho Rios
+    const ochiItems = items.filter(i => i.ochi);
+    if (ochiItems.length > 0 && supplier.addrOchoRios) {
+      body += `📍 *Ocho Rios*\n${supplier.addrOchoRios}\n`;
+      ochiItems.forEach(i => { body += `  ${i.name}: ${i.ochi}\n`; });
+      body += '\n';
+    }
+
     body += 'Thank you!';
     return [{ text: body, label: '' }];
   }
 
-  if (delivery.includes('village')) {
-    const messages    = [];
-    const hasOchi     = items.some(i => i.ochi !== '');
-    const hasKingston = items.some(i => i.village !== '' || i.wf !== '' || i.lig !== '');
+  // VILLAGE DELIVERY MODEL — Kingston consolidated + separate Ocho Rios
+  const messages    = [];
+  const kingstonItems = items.filter(i => i.village || i.wf || i.lig);
+  const ochiItems2    = items.filter(i => i.ochi);
 
-    if (hasKingston) {
-      let body = header + `Please prepare the following order for delivery to Village Plaza (Kingston stores):\n\n`;
-      for (const item of items) {
-        if (item.village || item.wf || item.lig) {
-          body += `${item.name}:\n`;
-          if (item.village) body += `  Village Plaza: ${item.village}\n`;
-          if (item.wf)      body += `  Waterfront:    ${item.wf}\n`;
-          if (item.lig)     body += `  Liguanea:      ${item.lig}\n`;
-          body += '\n';
-        }
-      }
-      body += 'Thank you!';
-      messages.push({ text: body, label: 'Kingston' });
-    }
+  if (kingstonItems.length > 0) {
+    let body = header +
+      `Please prepare the following order for delivery to Village Plaza (for Kingston stores):\n` +
+      (supplier.addrVillage ? `📍 ${supplier.addrVillage}\n` : '') + '\n';
 
-    if (hasOchi) {
-      let body = header + `Please prepare the following order for delivery to Ocho Rios:\n\n`;
-      for (const item of items) {
-        if (item.ochi) body += `${item.name}: ${item.ochi}\n`;
-      }
-      body += '\nThank you!';
-      messages.push({ text: body, label: 'Ocho Rios' });
-    }
-
-    return messages;
+    kingstonItems.forEach(i => {
+      body += `${i.name}:\n`;
+      if (i.village) body += `  Village Plaza: ${i.village}\n`;
+      if (i.wf)      body += `  Waterfront:    ${i.wf}\n`;
+      if (i.lig)     body += `  Liguanea:      ${i.lig}\n`;
+      body += '\n';
+    });
+    body += 'Thank you!';
+    messages.push({ text: body, label: 'Kingston' });
   }
 
-  // Fallback
-  let body = header;
-  for (const item of items) {
-    body += `${item.name}:\n`;
-    if (item.village) body += `  Village Plaza: ${item.village}\n`;
-    if (item.wf)      body += `  Waterfront:    ${item.wf}\n`;
-    if (item.lig)     body += `  Liguanea:      ${item.lig}\n`;
-    if (item.ochi)    body += `  Ocho Rios:     ${item.ochi}\n`;
-    body += '\n';
+  if (ochiItems2.length > 0) {
+    let body = header +
+      `Please prepare the following order for delivery to Ocho Rios:\n` +
+      (supplier.addrOchoRios ? `📍 ${supplier.addrOchoRios}\n` : '') + '\n';
+
+    ochiItems2.forEach(i => { body += `${i.name}: ${i.ochi}\n`; });
+    body += '\nThank you!';
+    messages.push({ text: body, label: 'Ocho Rios' });
   }
-  body += 'Thank you!';
-  return [{ text: body, label: '' }];
+
+  if (messages.length === 0) {
+    // Fallback — just list everything
+    let body = header;
+    items.forEach(i => {
+      body += `${i.name}:\n`;
+      if (i.village) body += `  Village Plaza: ${i.village}\n`;
+      if (i.wf)      body += `  Waterfront:    ${i.wf}\n`;
+      if (i.lig)     body += `  Liguanea:      ${i.lig}\n`;
+      if (i.ochi)    body += `  Ocho Rios:     ${i.ochi}\n`;
+      body += '\n';
+    });
+    body += 'Thank you!';
+    messages.push({ text: body, label: '' });
+  }
+
+  return messages;
 }
 
 // ── Monday prompt ─────────────────────────────────────────────
@@ -558,8 +597,7 @@ async function handleMessage(msg) {
     Object.keys(STORE_NAMES).forEach(s => {
       statusMsg += (submissions[s] ? '✅' : '⏳') + ' ' + STORE_NAMES[s] + '\n';
     });
-    const registered = Object.keys(knownChatIds);
-    statusMsg += `\n📌 Registered: ${registered.map(s => STORE_NAMES[s]).join(', ') || 'none'}`;
+    statusMsg += `\n📌 Registered: ${Object.keys(knownChatIds).map(s => STORE_NAMES[s]).join(', ') || 'none'}`;
     await send(chatId, statusMsg);
     return;
   }
