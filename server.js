@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.3
-// With message queue to prevent race conditions
+// PIZZA PLEASE — INVENTORY BOT v1.4
+// With message queue + review screens + simulate endpoint
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -43,10 +43,8 @@ const processed    = new Set();
 let weekComplete   = false;
 
 // ── Per-chat message queue ────────────────────────────────────
-// Ensures messages from the same chat are always processed
-// one at a time, in order, never in parallel.
-const queues     = {}; // chatId → array of message objects
-const processing = {}; // chatId → true while processing
+const queues     = {};
+const processing = {};
 
 async function enqueue(chatId, msg, type) {
   if (!queues[chatId]) queues[chatId] = [];
@@ -178,12 +176,10 @@ async function showReview(chatId, session, type) {
 
   let msg = `${emoji} *${label} Review — ${STORE_NAMES[session.store]}*\n`;
   msg    += `━━━━━━━━━━━━━━━━━━━━━━\n`;
-
   for (let i = 0; i < items.length; i++) {
     const val = answers[i] !== undefined ? answers[i] : '—';
     msg += `*${i + 1}.* ${items[i].name}: *${val}* ${items[i].uom}\n`;
   }
-
   msg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
   msg += `To edit an item, type its *number* (e.g. type *3* to edit item 3).\n`;
   msg += type === 'ingredients'
@@ -198,13 +194,12 @@ async function showReview(chatId, session, type) {
 // ── Handle numeric answer ─────────────────────────────────────
 async function handleAnswer(chatId, session, text) {
   const value = parseFloat(text.replace(/,/g, ''));
-
   if (isNaN(value) || value < 0) {
     await send(chatId, `⚠️ Please enter a number only. Try again:`);
     return;
   }
 
-  const type         = session.phase; // 'ingredients' or 'drinks'
+  const type         = session.phase;
   const indexToWrite = session.itemIndex;
 
   const result = await callSheetWriter({
@@ -220,7 +215,6 @@ async function handleAnswer(chatId, session, text) {
     return;
   }
 
-  // Store answer for review screen
   if (type === 'ingredients') {
     session.answers.ingredients[indexToWrite] = value;
   } else {
@@ -239,7 +233,6 @@ async function handleReviewEdit(chatId, session, text) {
     ? itemCache[session.store].ingredients
     : itemCache[session.store].drinks;
 
-  // Waiting for corrected value after staff selected an item number
   if (session.editing !== null) {
     const value = parseFloat(text.replace(/,/g, ''));
     if (isNaN(value) || value < 0) {
@@ -248,8 +241,7 @@ async function handleReviewEdit(chatId, session, text) {
     }
 
     const editIndex = session.editing;
-
-    const result = await callSheetWriter({
+    const result    = await callSheetWriter({
       action:   'writeCount',
       store:    session.store,
       type:     type === 'ingredients' ? 'ingredient' : 'drink',
@@ -275,7 +267,6 @@ async function handleReviewEdit(chatId, session, text) {
     return;
   }
 
-  // Expecting an item number to edit
   const num = parseInt(text);
   if (isNaN(num) || num < 1 || num > items.length) {
     await send(chatId,
@@ -328,7 +319,7 @@ async function finishSubmission(chatId, session) {
   }
 }
 
-// ── Supplier orders ───────────────────────────────────────────
+// ── Generate supplier orders ──────────────────────────────────
 async function generateSupplierOrders() {
   const result = await callSheetWriter({ action: 'getOrderData' });
   if (!result.ok) {
@@ -481,7 +472,6 @@ app.post('/webhook', async (req, res) => {
   if (processed.size > 1000) {
     [...processed].slice(0, 500).forEach(id => processed.delete(id));
   }
-
   if (update.message) {
     const chatId = String(update.message.chat.id);
     await enqueue(chatId, update.message, 'message');
@@ -599,7 +589,8 @@ async function handleCallback(query) {
     sessions[chatId]  = session;
     await send(chatId,
       `✅ *Ingredients confirmed!* Now let's do the drinks. 🥤\n\n` +
-      `${itemCache[session.store].drinks.length} items to go.`
+      `${itemCache[session.store].drinks.length} items to go.\n\n` +
+      `⚠️ *Remember:* Wait for each question before typing your answer.`
     );
     await askNextItem(chatId, session);
     return;
@@ -612,14 +603,18 @@ async function handleCallback(query) {
 }
 
 // ── Utility endpoints ─────────────────────────────────────────
+
+// Health check
 app.get('/', (req, res) => res.send('Pizza Please Inventory Bot — running ✅'));
 
+// Monday prompt
 app.get('/prompt', async (req, res) => {
   if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
   await sendMondayPrompt();
   res.json({ ok: true, message: 'Monday prompt sent' });
 });
 
+// Reset sessions
 app.get('/reset', (req, res) => {
   if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
   Object.keys(submissions).forEach(k => delete submissions[k]);
@@ -627,6 +622,25 @@ app.get('/reset', (req, res) => {
   Object.keys(itemCache).forEach(k  => delete itemCache[k]);
   weekComplete = false;
   res.send('Reset complete. knownChatIds preserved.');
+});
+
+// ── SIMULATE ALL STORES DONE — for testing order generation ──
+// Marks all 4 stores as submitted and fires generateSupplierOrders().
+// Hit this URL to test order generation without needing all 4 stores to submit:
+// https://pizza-please-inventory-bot.onrender.com/simulate-all-done?secret=PizzaInventory2026$
+app.get('/simulate-all-done', async (req, res) => {
+  if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
+
+  // Mark all stores as submitted
+  Object.keys(STORE_NAMES).forEach(s => submissions[s] = true);
+  weekComplete = true;
+
+  res.json({ ok: true, message: 'Simulating all stores done — generating supplier orders...' });
+
+  await send(OWNER_ID,
+    `🧪 *[TEST] Simulating all 4 stores submitted.*\nGenerating supplier orders now...`
+  );
+  await generateSupplierOrders();
 });
 
 const PORT = process.env.PORT || 3000;
