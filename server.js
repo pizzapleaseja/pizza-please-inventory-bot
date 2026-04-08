@@ -538,7 +538,8 @@ async function handleMessage(msg) {
         `I'll ask you for each item one by one.\n` +
         `📦 *Ingredients:* ${items.ingredients.length} items\n` +
         `🥤 *Drinks:* ${items.drinks.length} items\n\n` +
-        `You'll get a review screen after each section to check your answers.\n\n` +
+        `⚠️ *Important:* Wait for each question to appear before typing your answer. Send one number at a time only.\n\n` +
+        `You'll get a review screen after each section to check and correct your answers.\n\n` +
         `_(Type *RESTART* at any time to start over)_\n\nStarting now!`
       );
       await askNextItem(chatId, sessions[chatId]);
