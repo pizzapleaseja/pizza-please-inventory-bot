@@ -1,7 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.8
-// Email drafts created via Anthropic API + Gmail MCP
-// WhatsApp orders sent as Telegram messages to Village + Owner
+// PIZZA PLEASE — INVENTORY BOT v1.7
+// All orders sent as Telegram messages to Village + Owner
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -43,7 +42,6 @@ const itemCache    = {};
 const processed    = new Set();
 let weekComplete   = false;
 
-// ── Per-chat message queue ────────────────────────────────────
 const queues     = {};
 const processing = {};
 
@@ -68,7 +66,6 @@ async function drainQueue(chatId) {
   processing[chatId] = false;
 }
 
-// ── Helpers ───────────────────────────────────────────────────
 function getStore(from, chatId) {
   chatId = String(chatId);
   if (chatId === OWNER_ID) return 'village';
@@ -86,14 +83,12 @@ function pendingStores() {
   return Object.keys(STORE_NAMES).filter(s => !submissions[s]);
 }
 
-// ── Send to both Village Plaza and Owner ──────────────────────
 async function sendToAll(text) {
   const villageChatId = knownChatIds['village'];
   if (villageChatId) await send(villageChatId, text);
   await send(OWNER_ID, text);
 }
 
-// ── Telegram API ──────────────────────────────────────────────
 async function send(chatId, text) {
   const MAX = 4000;
   if (text.length <= MAX) {
@@ -149,40 +144,6 @@ async function callSheetWriter(payload) {
   return res.json();
 }
 
-// ── Create Gmail draft via Anthropic API + Gmail MCP ─────────
-async function createGmailDraft(to, subject, body) {
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{
-          role:    'user',
-          content: `Create a Gmail draft with the following details and confirm when done:
-To: ${to}
-Subject: ${subject}
-Body:
-${body}`
-        }],
-        mcp_servers: [{
-          type: 'url',
-          url:  'https://gmail.mcp.claude.com/mcp',
-          name: 'gmail'
-        }]
-      })
-    });
-    const data = await response.json();
-    console.log('Gmail draft creation response:', JSON.stringify(data).slice(0, 200));
-    return { ok: true };
-  } catch (err) {
-    console.error('createGmailDraft error:', err);
-    return { ok: false, error: err.toString() };
-  }
-}
-
-// ── Load items ────────────────────────────────────────────────
 async function loadItems(store) {
   if (itemCache[store]) return itemCache[store];
   const result = await callSheetWriter({ action: 'getItems', store });
@@ -191,7 +152,6 @@ async function loadItems(store) {
   return itemCache[store];
 }
 
-// ── Ask next item ─────────────────────────────────────────────
 async function askNextItem(chatId, session) {
   const items = itemCache[session.store];
   if (session.phase === 'ingredients') {
@@ -215,7 +175,6 @@ async function askNextItem(chatId, session) {
   }
 }
 
-// ── Show review screen ────────────────────────────────────────
 async function showReview(chatId, session, type) {
   session.phase    = type === 'ingredients' ? 'review_ingredients' : 'review_drinks';
   session.editing  = null;
@@ -248,7 +207,6 @@ async function showReview(chatId, session, type) {
   ]);
 }
 
-// ── Handle answer ─────────────────────────────────────────────
 async function handleAnswer(chatId, session, text) {
   const value = parseFloat(text.replace(/,/g, ''));
   if (isNaN(value) || value < 0) {
@@ -283,7 +241,6 @@ async function handleAnswer(chatId, session, text) {
   await askNextItem(chatId, session);
 }
 
-// ── Handle review edit ────────────────────────────────────────
 async function handleReviewEdit(chatId, session, text) {
   const type  = session.phase === 'review_ingredients' ? 'ingredients' : 'drinks';
   const items = type === 'ingredients'
@@ -338,7 +295,6 @@ async function handleReviewEdit(chatId, session, text) {
   );
 }
 
-// ── Finish submission ─────────────────────────────────────────
 async function finishSubmission(chatId, session) {
   session.phase    = 'done';
   sessions[chatId] = session;
@@ -369,7 +325,6 @@ async function finishSubmission(chatId, session) {
   }
 }
 
-// ── Generate supplier orders ──────────────────────────────────
 async function generateSupplierOrders() {
   const result = await callSheetWriter({ action: 'getOrderData' });
   if (!result.ok) {
@@ -397,7 +352,7 @@ async function generateSupplierOrders() {
   await sendToAll(
     `🛒 *Supplier Orders — ${dateStr}*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `📧 = Email order (draft created in pizzapleaseordering@gmail.com)\n` +
+    `📧 = Email order (copy/paste into pizzapleaseordering@gmail.com)\n` +
     `💬 = WhatsApp order (copy/paste and send)`
   );
 
@@ -410,39 +365,19 @@ async function generateSupplierOrders() {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
-      // ── EMAIL — draft created via Anthropic API + Gmail MCP ──
       if (contact.includes('email')) {
-        const draftResult = await createGmailDraft(
-          supplier.email || '',
-          subject,
-          msg.text
-        );
-
-        if (draftResult.ok) {
-          await sendToAll(
-            `📧 *EMAIL DRAFT CREATED — ${supplierName}*${label}\n` +
-            `━━━━━━━━━━━━━━━━━━━━━━\n` +
-            `*To:* ${supplier.email || 'no email on file'}\n` +
-            `*Subject:* ${subject}\n` +
-            (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
-            `_Draft saved in pizzapleaseordering@gmail.com_`
-          );
-        } else {
-          // Fallback — send as Telegram message if draft creation fails
-          await sendToAll(
-            `📧 *EMAIL ORDER — ${supplierName}*${label} _(draft failed — copy/paste below)_\n` +
-            `━━━━━━━━━━━━━━━━━━━━━━\n` +
-            `*To:* ${supplier.email || 'no email on file'}\n` +
-            `*Subject:* ${subject}\n` +
-            (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
-            `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-            msg.text
-          );
-        }
+        const emailMsg =
+          `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `*To:* ${supplier.email || 'no email on file'}\n` +
+          `*Subject:* ${subject}\n` +
+          (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
+          `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          msg.text;
+        await sendToAll(emailMsg);
         emailCount++;
       }
 
-      // ── WHATSAPP — sent to Village + Owner for copy/paste ──
       if (contact.includes('whatsapp')) {
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
@@ -452,7 +387,6 @@ async function generateSupplierOrders() {
           (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
           `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
           msg.text;
-
         await sendToAll(waMsg);
         whatsappCount++;
       }
@@ -461,12 +395,11 @@ async function generateSupplierOrders() {
 
   await sendToAll(
     `✅ *All supplier orders generated!*\n\n` +
-    `📧 ${emailCount} email draft(s) → pizzapleaseordering@gmail.com\n` +
-    `💬 ${whatsappCount} WhatsApp order(s) → copy/paste and send`
+    `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
+    `💬 ${whatsappCount} WhatsApp order(s) — copy/paste and send`
   );
 }
 
-// ── Build order messages ──────────────────────────────────────
 function buildOrderMessages(supplier, delivery, dateStr) {
   const items  = supplier.items;
   const name   = supplier.name;
@@ -477,7 +410,6 @@ function buildOrderMessages(supplier, delivery, dateStr) {
 
   if (delivery.includes('direct')) {
     let body = header + `Please prepare the following order for delivery to each location:\n\n`;
-
     const villageItems = items.filter(i => i.village);
     if (villageItems.length > 0) {
       body += `Village Plaza\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
@@ -551,7 +483,6 @@ function buildOrderMessages(supplier, delivery, dateStr) {
   return messages;
 }
 
-// ── Monday prompt ─────────────────────────────────────────────
 async function sendMondayPrompt() {
   weekComplete = false;
   Object.keys(submissions).forEach(k => delete submissions[k]);
@@ -576,7 +507,6 @@ async function sendMondayPrompt() {
   await send(OWNER_ID, ownerMsg);
 }
 
-// ── Webhook ───────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -596,7 +526,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ── Message handler ───────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = String(msg.chat.id);
   const text   = (msg.text || '').trim();
@@ -684,7 +613,6 @@ async function handleMessage(msg) {
   }
 }
 
-// ── Callback handler ──────────────────────────────────────────
 async function handleCallback(query) {
   const chatId = String(query.message.chat.id);
   const data   = query.data;
@@ -715,7 +643,6 @@ async function handleCallback(query) {
   }
 }
 
-// ── Utility endpoints ─────────────────────────────────────────
 app.get('/', (req, res) => res.send('Pizza Please Inventory Bot — running ✅'));
 
 app.get('/prompt', async (req, res) => {
