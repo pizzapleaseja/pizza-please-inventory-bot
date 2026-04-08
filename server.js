@@ -1,7 +1,7 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.7
-// All orders (email + whatsapp) sent as Telegram messages
-// to Village Plaza and Owner for copy/paste/forward
+// PIZZA PLEASE — INVENTORY BOT v1.8
+// Email drafts created via Anthropic API + Gmail MCP
+// WhatsApp orders sent as Telegram messages to Village + Owner
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -95,7 +95,6 @@ async function sendToAll(text) {
 
 // ── Telegram API ──────────────────────────────────────────────
 async function send(chatId, text) {
-  // Telegram has a 4096 char limit per message — split if needed
   const MAX = 4000;
   if (text.length <= MAX) {
     await fetch(`${BASE_URL}/sendMessage`, {
@@ -104,7 +103,6 @@ async function send(chatId, text) {
       body:    JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' }),
     }).catch(e => console.error('send error:', e));
   } else {
-    // Split into chunks
     const chunks = [];
     let remaining = text;
     while (remaining.length > 0) {
@@ -149,6 +147,39 @@ async function callSheetWriter(payload) {
     body:    JSON.stringify({ ...payload, secret: SHEET_SECRET }),
   });
   return res.json();
+}
+
+// ── Create Gmail draft via Anthropic API + Gmail MCP ─────────
+async function createGmailDraft(to, subject, body) {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{
+          role:    'user',
+          content: `Create a Gmail draft with the following details and confirm when done:
+To: ${to}
+Subject: ${subject}
+Body:
+${body}`
+        }],
+        mcp_servers: [{
+          type: 'url',
+          url:  'https://gmail.mcp.claude.com/mcp',
+          name: 'gmail'
+        }]
+      })
+    });
+    const data = await response.json();
+    console.log('Gmail draft creation response:', JSON.stringify(data).slice(0, 200));
+    return { ok: true };
+  } catch (err) {
+    console.error('createGmailDraft error:', err);
+    return { ok: false, error: err.toString() };
+  }
 }
 
 // ── Load items ────────────────────────────────────────────────
@@ -363,12 +394,11 @@ async function generateSupplierOrders() {
   let emailCount    = 0;
   let whatsappCount = 0;
 
-  // Send a header first so Pietro knows orders are coming
   await sendToAll(
     `🛒 *Supplier Orders — ${dateStr}*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `All orders below are ready to copy/paste and send.\n` +
-    `📧 = Email order   💬 = WhatsApp order`
+    `📧 = Email order (draft created in pizzapleaseordering@gmail.com)\n` +
+    `💬 = WhatsApp order (copy/paste and send)`
   );
 
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
@@ -377,24 +407,42 @@ async function generateSupplierOrders() {
     const messages = buildOrderMessages(supplier, delivery, dateStr);
 
     for (const msg of messages) {
-      const label = msg.label ? ` (${msg.label})` : '';
+      const label   = msg.label ? ` (${msg.label})` : '';
+      const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
-      // ── EMAIL ORDER — sent as Telegram message to both Village + Owner ──
+      // ── EMAIL — draft created via Anthropic API + Gmail MCP ──
       if (contact.includes('email')) {
-        const emailMsg =
-          `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
-          `━━━━━━━━━━━━━━━━━━━━━━\n` +
-          `*To:* ${supplier.email || 'no email on file'}\n` +
-          `*Subject:* Order Request — ${supplierName}${label} — ${dateStr}\n` +
-          (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
-          `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-          msg.text;
+        const draftResult = await createGmailDraft(
+          supplier.email || '',
+          subject,
+          msg.text
+        );
 
-        await sendToAll(emailMsg);
+        if (draftResult.ok) {
+          await sendToAll(
+            `📧 *EMAIL DRAFT CREATED — ${supplierName}*${label}\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `*To:* ${supplier.email || 'no email on file'}\n` +
+            `*Subject:* ${subject}\n` +
+            (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
+            `_Draft saved in pizzapleaseordering@gmail.com_`
+          );
+        } else {
+          // Fallback — send as Telegram message if draft creation fails
+          await sendToAll(
+            `📧 *EMAIL ORDER — ${supplierName}*${label} _(draft failed — copy/paste below)_\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `*To:* ${supplier.email || 'no email on file'}\n` +
+            `*Subject:* ${subject}\n` +
+            (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
+            `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+            msg.text
+          );
+        }
         emailCount++;
       }
 
-      // ── WHATSAPP ORDER — sent to both Village + Owner ──
+      // ── WHATSAPP — sent to Village + Owner for copy/paste ──
       if (contact.includes('whatsapp')) {
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
@@ -412,9 +460,9 @@ async function generateSupplierOrders() {
   }
 
   await sendToAll(
-    `✅ *All supplier orders sent!*\n\n` +
-    `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
-    `💬 ${whatsappCount} WhatsApp order(s) — copy/paste and send via WhatsApp`
+    `✅ *All supplier orders generated!*\n\n` +
+    `📧 ${emailCount} email draft(s) → pizzapleaseordering@gmail.com\n` +
+    `💬 ${whatsappCount} WhatsApp order(s) → copy/paste and send`
   );
 }
 
@@ -427,43 +475,37 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     `Supplier: ${name}\n` +
     `Date: ${dateStr}\n\n`;
 
-  // DIRECT TO ALL STORES
   if (delivery.includes('direct')) {
     let body = header + `Please prepare the following order for delivery to each location:\n\n`;
 
     const villageItems = items.filter(i => i.village);
     if (villageItems.length > 0) {
-      body += `📍 *Village Plaza*\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
+      body += `Village Plaza\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
       villageItems.forEach(i => { body += `  ${i.name}: ${i.village}\n`; });
       body += '\n';
     }
-
     const wfItems = items.filter(i => i.wf);
     if (wfItems.length > 0) {
-      body += `📍 *Waterfront*\n${supplier.addrWaterfront ? supplier.addrWaterfront + '\n' : ''}`;
+      body += `Waterfront\n${supplier.addrWaterfront ? supplier.addrWaterfront + '\n' : ''}`;
       wfItems.forEach(i => { body += `  ${i.name}: ${i.wf}\n`; });
       body += '\n';
     }
-
     const ligItems = items.filter(i => i.lig);
     if (ligItems.length > 0) {
-      body += `📍 *Liguanea*\n${supplier.addrLiguanea ? supplier.addrLiguanea + '\n' : ''}`;
+      body += `Liguanea\n${supplier.addrLiguanea ? supplier.addrLiguanea + '\n' : ''}`;
       ligItems.forEach(i => { body += `  ${i.name}: ${i.lig}\n`; });
       body += '\n';
     }
-
     const ochiItems = items.filter(i => i.ochi);
     if (ochiItems.length > 0) {
-      body += `📍 *Ocho Rios*\n${supplier.addrOchoRios ? supplier.addrOchoRios + '\n' : ''}`;
+      body += `Ocho Rios\n${supplier.addrOchoRios ? supplier.addrOchoRios + '\n' : ''}`;
       ochiItems.forEach(i => { body += `  ${i.name}: ${i.ochi}\n`; });
       body += '\n';
     }
-
     body += 'Thank you!';
     return [{ text: body, label: '' }];
   }
 
-  // VILLAGE DELIVERY MODEL
   const messages      = [];
   const kingstonItems = items.filter(i => i.village || i.wf || i.lig);
   const ochiItems2    = items.filter(i => i.ochi);
@@ -471,7 +513,7 @@ function buildOrderMessages(supplier, delivery, dateStr) {
   if (kingstonItems.length > 0) {
     let body = header +
       `Please prepare the following order for delivery to Village Plaza (for Kingston stores):\n` +
-      (supplier.addrVillage ? `📍 ${supplier.addrVillage}\n` : '') + '\n';
+      (supplier.addrVillage ? supplier.addrVillage + '\n' : '') + '\n';
     kingstonItems.forEach(i => {
       body += `${i.name}:\n`;
       if (i.village) body += `  Village Plaza: ${i.village}\n`;
@@ -486,7 +528,7 @@ function buildOrderMessages(supplier, delivery, dateStr) {
   if (ochiItems2.length > 0) {
     let body = header +
       `Please prepare the following order for delivery to Ocho Rios:\n` +
-      (supplier.addrOchoRios ? `📍 ${supplier.addrOchoRios}\n` : '') + '\n';
+      (supplier.addrOchoRios ? supplier.addrOchoRios + '\n' : '') + '\n';
     ochiItems2.forEach(i => { body += `${i.name}: ${i.ochi}\n`; });
     body += '\nThank you!';
     messages.push({ text: body, label: 'Ocho Rios' });
