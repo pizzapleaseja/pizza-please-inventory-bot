@@ -1,6 +1,7 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.6
-// Full supplier details from Suppliers tab
+// PIZZA PLEASE — INVENTORY BOT v1.7
+// All orders (email + whatsapp) sent as Telegram messages
+// to Village Plaza and Owner for copy/paste/forward
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -85,13 +86,39 @@ function pendingStores() {
   return Object.keys(STORE_NAMES).filter(s => !submissions[s]);
 }
 
+// ── Send to both Village Plaza and Owner ──────────────────────
+async function sendToAll(text) {
+  const villageChatId = knownChatIds['village'];
+  if (villageChatId) await send(villageChatId, text);
+  await send(OWNER_ID, text);
+}
+
 // ── Telegram API ──────────────────────────────────────────────
 async function send(chatId, text) {
-  await fetch(`${BASE_URL}/sendMessage`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' }),
-  }).catch(e => console.error('send error:', e));
+  // Telegram has a 4096 char limit per message — split if needed
+  const MAX = 4000;
+  if (text.length <= MAX) {
+    await fetch(`${BASE_URL}/sendMessage`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' }),
+    }).catch(e => console.error('send error:', e));
+  } else {
+    // Split into chunks
+    const chunks = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+      chunks.push(remaining.slice(0, MAX));
+      remaining = remaining.slice(MAX);
+    }
+    for (const chunk of chunks) {
+      await fetch(`${BASE_URL}/sendMessage`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: 'Markdown' }),
+      }).catch(e => console.error('send error:', e));
+    }
+  }
 }
 
 async function sendKb(chatId, text, keyboard) {
@@ -336,6 +363,14 @@ async function generateSupplierOrders() {
   let emailCount    = 0;
   let whatsappCount = 0;
 
+  // Send a header first so Pietro knows orders are coming
+  await sendToAll(
+    `🛒 *Supplier Orders — ${dateStr}*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `All orders below are ready to copy/paste and send.\n` +
+    `📧 = Email order   💬 = WhatsApp order`
+  );
+
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
     const contact  = (supplier.contactMethod || '').toLowerCase();
     const delivery = (supplier.delivery      || '').toLowerCase();
@@ -344,43 +379,42 @@ async function generateSupplierOrders() {
     for (const msg of messages) {
       const label = msg.label ? ` (${msg.label})` : '';
 
-      // ── EMAIL ──
+      // ── EMAIL ORDER — sent as Telegram message to both Village + Owner ──
       if (contact.includes('email')) {
-        await callSheetWriter({
-          action:  'createEmailDraft',
-          to:      supplier.email || '',
-          subject: `Order Request — ${supplierName}${label} — ${dateStr}`,
-          body:    msg.text,
-        });
-        await send(OWNER_ID,
-          `📧 Email draft created for *${supplierName}*${label}\n` +
-          `_To: ${supplier.email || 'no email on file'}_\n` +
-          `_Check pizzapleaseordering@gmail.com drafts_`
-        );
+        const emailMsg =
+          `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `*To:* ${supplier.email || 'no email on file'}\n` +
+          `*Subject:* Order Request — ${supplierName}${label} — ${dateStr}\n` +
+          (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
+          `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          msg.text;
+
+        await sendToAll(emailMsg);
         emailCount++;
       }
 
-      // ── WHATSAPP ──
+      // ── WHATSAPP ORDER — sent to both Village + Owner ──
       if (contact.includes('whatsapp')) {
-        const waHeader =
-          `📋 *Order — ${supplierName}*${label}\n` +
-          (supplier.contactName ? `_Attn: ${supplier.contactName}_\n` : '') +
-          (supplier.whatsapp    ? `_WhatsApp: ${supplier.whatsapp}_\n` : '') +
-          (supplier.deliveryDay ? `_Delivery day: ${supplier.deliveryDay}_\n` : '') +
-          `\n`;
-        const waMsg = waHeader + msg.text;
-        const villageChatId = knownChatIds['village'];
-        if (villageChatId) await send(villageChatId, waMsg);
-        await send(OWNER_ID, waMsg);
+        const waMsg =
+          `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          (supplier.contactName ? `*Attn:* ${supplier.contactName}\n` : '') +
+          (supplier.whatsapp    ? `*WhatsApp:* ${supplier.whatsapp}\n` : '') +
+          (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
+          `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          msg.text;
+
+        await sendToAll(waMsg);
         whatsappCount++;
       }
     }
   }
 
-  await send(OWNER_ID,
-    `✅ *All supplier orders generated!*\n\n` +
-    `📧 ${emailCount} email draft(s) → pizzapleaseordering@gmail.com\n` +
-    `💬 ${whatsappCount} WhatsApp message(s) sent above for copy/paste`
+  await sendToAll(
+    `✅ *All supplier orders sent!*\n\n` +
+    `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
+    `💬 ${whatsappCount} WhatsApp order(s) — copy/paste and send via WhatsApp`
   );
 }
 
@@ -393,38 +427,34 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     `Supplier: ${name}\n` +
     `Date: ${dateStr}\n\n`;
 
-  // DIRECT TO ALL STORES — each store gets its own delivery
+  // DIRECT TO ALL STORES
   if (delivery.includes('direct')) {
     let body = header + `Please prepare the following order for delivery to each location:\n\n`;
 
-    // Village
     const villageItems = items.filter(i => i.village);
-    if (villageItems.length > 0 && supplier.addrVillage) {
-      body += `📍 *Village Plaza*\n${supplier.addrVillage}\n`;
+    if (villageItems.length > 0) {
+      body += `📍 *Village Plaza*\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
       villageItems.forEach(i => { body += `  ${i.name}: ${i.village}\n`; });
       body += '\n';
     }
 
-    // Waterfront
     const wfItems = items.filter(i => i.wf);
-    if (wfItems.length > 0 && supplier.addrWaterfront) {
-      body += `📍 *Waterfront*\n${supplier.addrWaterfront}\n`;
+    if (wfItems.length > 0) {
+      body += `📍 *Waterfront*\n${supplier.addrWaterfront ? supplier.addrWaterfront + '\n' : ''}`;
       wfItems.forEach(i => { body += `  ${i.name}: ${i.wf}\n`; });
       body += '\n';
     }
 
-    // Liguanea
     const ligItems = items.filter(i => i.lig);
-    if (ligItems.length > 0 && supplier.addrLiguanea) {
-      body += `📍 *Liguanea*\n${supplier.addrLiguanea}\n`;
+    if (ligItems.length > 0) {
+      body += `📍 *Liguanea*\n${supplier.addrLiguanea ? supplier.addrLiguanea + '\n' : ''}`;
       ligItems.forEach(i => { body += `  ${i.name}: ${i.lig}\n`; });
       body += '\n';
     }
 
-    // Ocho Rios
     const ochiItems = items.filter(i => i.ochi);
-    if (ochiItems.length > 0 && supplier.addrOchoRios) {
-      body += `📍 *Ocho Rios*\n${supplier.addrOchoRios}\n`;
+    if (ochiItems.length > 0) {
+      body += `📍 *Ocho Rios*\n${supplier.addrOchoRios ? supplier.addrOchoRios + '\n' : ''}`;
       ochiItems.forEach(i => { body += `  ${i.name}: ${i.ochi}\n`; });
       body += '\n';
     }
@@ -433,8 +463,8 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     return [{ text: body, label: '' }];
   }
 
-  // VILLAGE DELIVERY MODEL — Kingston consolidated + separate Ocho Rios
-  const messages    = [];
+  // VILLAGE DELIVERY MODEL
+  const messages      = [];
   const kingstonItems = items.filter(i => i.village || i.wf || i.lig);
   const ochiItems2    = items.filter(i => i.ochi);
 
@@ -442,7 +472,6 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     let body = header +
       `Please prepare the following order for delivery to Village Plaza (for Kingston stores):\n` +
       (supplier.addrVillage ? `📍 ${supplier.addrVillage}\n` : '') + '\n';
-
     kingstonItems.forEach(i => {
       body += `${i.name}:\n`;
       if (i.village) body += `  Village Plaza: ${i.village}\n`;
@@ -458,14 +487,12 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     let body = header +
       `Please prepare the following order for delivery to Ocho Rios:\n` +
       (supplier.addrOchoRios ? `📍 ${supplier.addrOchoRios}\n` : '') + '\n';
-
     ochiItems2.forEach(i => { body += `${i.name}: ${i.ochi}\n`; });
     body += '\nThank you!';
     messages.push({ text: body, label: 'Ocho Rios' });
   }
 
   if (messages.length === 0) {
-    // Fallback — just list everything
     let body = header;
     items.forEach(i => {
       body += `${i.name}:\n`;
