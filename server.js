@@ -1,7 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.8
-// WhatsApp: wa.me link on phone number (no pre-filled message)
-// Email: unchanged (mailto links work as Telegram hyperlinks)
+// PIZZA PLEASE — INVENTORY BOT v1.7
+// All orders sent as Telegram messages to Village + Owner
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -353,8 +352,8 @@ async function generateSupplierOrders() {
   await sendToAll(
     `🛒 *Supplier Orders — ${dateStr}*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `📧 = Email order (tap address to open email app)\n` +
-    `💬 = WhatsApp order (tap number to open chat, copy/paste order text)`
+    `📧 = Email order (copy/paste into pizzapleaseordering@gmail.com)\n` +
+    `💬 = WhatsApp order (copy/paste and send)`
   );
 
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
@@ -366,7 +365,6 @@ async function generateSupplierOrders() {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
-      // ── EMAIL — unchanged, mailto link acts as hyperlink in Telegram ──
       if (contact.includes('email')) {
         const emailMsg =
           `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
@@ -380,22 +378,15 @@ async function generateSupplierOrders() {
         emailCount++;
       }
 
-      // ── WHATSAPP — phone number as wa.me link, order text to copy/paste ──
       if (contact.includes('whatsapp')) {
-        const waNumber = (supplier.whatsapp || '').replace(/\D/g, '');
-        const waLink   = waNumber ? `https://wa.me/${waNumber}` : null;
-
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
           `━━━━━━━━━━━━━━━━━━━━━━\n` +
           (supplier.contactName ? `*Attn:* ${supplier.contactName}\n` : '') +
-          (waLink
-            ? `*WhatsApp:* [${supplier.whatsapp}](${waLink})\n`
-            : (supplier.whatsapp ? `*WhatsApp:* ${supplier.whatsapp}\n` : '')) +
+          (supplier.whatsapp    ? `*WhatsApp:* ${supplier.whatsapp}\n` : '') +
           (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
           `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
           msg.text;
-
         await sendToAll(waMsg);
         whatsappCount++;
       }
@@ -404,8 +395,8 @@ async function generateSupplierOrders() {
 
   await sendToAll(
     `✅ *All supplier orders generated!*\n\n` +
-    `📧 ${emailCount} email order(s) — tap address to open email app\n` +
-    `💬 ${whatsappCount} WhatsApp order(s) — tap number to open chat`
+    `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
+    `💬 ${whatsappCount} WhatsApp order(s) — copy/paste and send`
   );
 }
 
