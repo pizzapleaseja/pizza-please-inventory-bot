@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.7
-// All orders sent as Telegram messages to Village + Owner
+// PIZZA PLEASE — INVENTORY BOT v1.8
+// WhatsApp orders with wa.me deep links for one-tap sending
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -353,7 +353,7 @@ async function generateSupplierOrders() {
     `🛒 *Supplier Orders — ${dateStr}*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `📧 = Email order (copy/paste into pizzapleaseordering@gmail.com)\n` +
-    `💬 = WhatsApp order (copy/paste and send)`
+    `💬 = WhatsApp order (tap link to open WhatsApp with message ready)`
   );
 
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
@@ -365,6 +365,7 @@ async function generateSupplierOrders() {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
+      // ── EMAIL — sent as Telegram message ──
       if (contact.includes('email')) {
         const emailMsg =
           `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
@@ -378,7 +379,26 @@ async function generateSupplierOrders() {
         emailCount++;
       }
 
+      // ── WHATSAPP — with wa.me deep link ──
       if (contact.includes('whatsapp')) {
+        // Build clean order text for the wa.me link
+        const orderText =
+          `Pizza Please — Order Request\n` +
+          `Supplier: ${supplierName}${label}\n` +
+          `Date: ${dateStr}\n\n` +
+          msg.text;
+
+        // Strip markdown formatting for WhatsApp plain text
+        const plainText = orderText
+          .replace(/\*([^*]+)\*/g, '$1')  // remove bold
+          .replace(/_([^_]+)_/g, '$1');   // remove italic
+
+        // Build wa.me link — digits only for number
+        const waNumber  = (supplier.whatsapp || '').replace(/\D/g, '');
+        const waLink    = waNumber
+          ? `https://wa.me/${waNumber}?text=${encodeURIComponent(plainText)}`
+          : null;
+
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
           `━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -386,7 +406,9 @@ async function generateSupplierOrders() {
           (supplier.whatsapp    ? `*WhatsApp:* ${supplier.whatsapp}\n` : '') +
           (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
           `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          (waLink ? `👆 [Tap to open WhatsApp with order ready to send](${waLink})\n\n` : '') +
           msg.text;
+
         await sendToAll(waMsg);
         whatsappCount++;
       }
@@ -396,7 +418,7 @@ async function generateSupplierOrders() {
   await sendToAll(
     `✅ *All supplier orders generated!*\n\n` +
     `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
-    `💬 ${whatsappCount} WhatsApp order(s) — copy/paste and send`
+    `💬 ${whatsappCount} WhatsApp order(s) — tap link to open WhatsApp and send`
   );
 }
 
