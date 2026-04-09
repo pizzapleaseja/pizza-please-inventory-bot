@@ -1,6 +1,7 @@
 // ============================================================
 // PIZZA PLEASE — INVENTORY BOT v1.8
-// WhatsApp orders with wa.me deep links for one-tap sending
+// WhatsApp: wa.me link on phone number (no pre-filled message)
+// Email: unchanged (mailto links work as Telegram hyperlinks)
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -352,8 +353,8 @@ async function generateSupplierOrders() {
   await sendToAll(
     `🛒 *Supplier Orders — ${dateStr}*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-    `📧 = Email order (copy/paste into pizzapleaseordering@gmail.com)\n` +
-    `💬 = WhatsApp order (tap link to open WhatsApp with message ready)`
+    `📧 = Email order (tap address to open email app)\n` +
+    `💬 = WhatsApp order (tap number to open chat, copy/paste order text)`
   );
 
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
@@ -365,7 +366,7 @@ async function generateSupplierOrders() {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
-      // ── EMAIL — sent as Telegram message ──
+      // ── EMAIL — unchanged, mailto link acts as hyperlink in Telegram ──
       if (contact.includes('email')) {
         const emailMsg =
           `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
@@ -379,34 +380,20 @@ async function generateSupplierOrders() {
         emailCount++;
       }
 
-      // ── WHATSAPP — with wa.me deep link ──
+      // ── WHATSAPP — phone number as wa.me link, order text to copy/paste ──
       if (contact.includes('whatsapp')) {
-        // Build clean order text for the wa.me link
-        const orderText =
-          `Pizza Please — Order Request\n` +
-          `Supplier: ${supplierName}${label}\n` +
-          `Date: ${dateStr}\n\n` +
-          msg.text;
-
-        // Strip markdown formatting for WhatsApp plain text
-        const plainText = orderText
-          .replace(/\*([^*]+)\*/g, '$1')  // remove bold
-          .replace(/_([^_]+)_/g, '$1');   // remove italic
-
-        // Build wa.me link — digits only for number
-        const waNumber  = (supplier.whatsapp || '').replace(/\D/g, '');
-        const waLink    = waNumber
-          ? `https://wa.me/${waNumber}?text=${encodeURIComponent(plainText)}`
-          : null;
+        const waNumber = (supplier.whatsapp || '').replace(/\D/g, '');
+        const waLink   = waNumber ? `https://wa.me/${waNumber}` : null;
 
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
           `━━━━━━━━━━━━━━━━━━━━━━\n` +
           (supplier.contactName ? `*Attn:* ${supplier.contactName}\n` : '') +
-          (supplier.whatsapp    ? `*WhatsApp:* ${supplier.whatsapp}\n` : '') +
+          (waLink
+            ? `*WhatsApp:* [${supplier.whatsapp}](${waLink})\n`
+            : (supplier.whatsapp ? `*WhatsApp:* ${supplier.whatsapp}\n` : '')) +
           (supplier.deliveryDay ? `*Delivery day:* ${supplier.deliveryDay}\n` : '') +
           `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-          (waLink ? `👆 [Tap to open WhatsApp with order ready to send](${waLink})\n\n` : '') +
           msg.text;
 
         await sendToAll(waMsg);
@@ -417,8 +404,8 @@ async function generateSupplierOrders() {
 
   await sendToAll(
     `✅ *All supplier orders generated!*\n\n` +
-    `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
-    `💬 ${whatsappCount} WhatsApp order(s) — tap link to open WhatsApp and send`
+    `📧 ${emailCount} email order(s) — tap address to open email app\n` +
+    `💬 ${whatsappCount} WhatsApp order(s) — tap number to open chat`
   );
 }
 
