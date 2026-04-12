@@ -1,6 +1,7 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.9
-// Adds Mega Mart PDF purchase order generation
+// PIZZA PLEASE — INVENTORY BOT v2.0
+// Adds 8:30 AM safety check before generating supplier orders
+// to ensure Revel sync data is available first
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -162,14 +163,13 @@ async function sendPdfToChat(chatId, base64Data, fileName, caption) {
       bodyParts += `${caption}${CRLF}`;
     }
 
-    const headerStr = bodyParts;
     const fileHeader =
       `--${boundary}${CRLF}` +
       `Content-Disposition: form-data; name="document"; filename="${fileName}"${CRLF}` +
       `Content-Type: application/pdf${CRLF}${CRLF}`;
     const footer = `${CRLF}--${boundary}--${CRLF}`;
 
-    const headerBuf = Buffer.from(headerStr + fileHeader, 'utf8');
+    const headerBuf = Buffer.from(bodyParts + fileHeader, 'utf8');
     const footerBuf = Buffer.from(footer, 'utf8');
     const body      = Buffer.concat([headerBuf, buffer, footerBuf]);
 
@@ -189,15 +189,12 @@ async function sendPdfToAll(base64Data, fileName, caption) {
   await sendPdfToChat(OWNER_ID, base64Data, fileName, caption);
 }
 
-// ── Parse kg quantity from text ───────────────────────────────
-// Extracts numeric value from strings like "5 KG", "10kg", "5Kg" etc.
 function parseKg(text) {
   if (!text) return 0;
   const match = String(text).match(/(\d+(?:\.\d+)?)/);
   return match ? parseFloat(match[1]) : 0;
 }
 
-// ── Load items ────────────────────────────────────────────────
 async function loadItems(store) {
   if (itemCache[store]) return itemCache[store];
   const result = await callSheetWriter({ action: 'getItems', store });
@@ -363,14 +360,38 @@ async function finishSubmission(chatId, session) {
   );
 
   const pending = pendingStores();
+
   if (pending.length === 0 && !weekComplete) {
     weekComplete = true;
-    await send(OWNER_ID,
-      `${icon} *${storeName}* submitted. ✅\n\n` +
-      `🎉 *All 4 stores have submitted their inventory!*\n` +
-      `Generating supplier orders now...`
-    );
-    await generateSupplierOrders();
+
+    // ── Safety check: wait until 8:30 AM Jamaica time ──────────────────────
+    // Revel sync runs at 7:15 and 7:20 AM. Order formulas depend on that data.
+    // If all stores submit before 8:30 AM, hold the order generation until then.
+    const nowJA     = new Date(Date.now() - 5 * 3600000);
+    const totalMins = nowJA.getUTCHours() * 60 + nowJA.getUTCMinutes();
+    const safeTime  = 8 * 60 + 30; // 8:30 AM Jamaica time
+
+    if (totalMins < safeTime) {
+      const waitMins = safeTime - totalMins;
+      await send(OWNER_ID,
+        `${icon} *${storeName}* submitted. ✅\n\n` +
+        `🎉 *All 4 stores have submitted their inventory!*\n\n` +
+        `⏳ Supplier orders will be generated at *8:30 AM* to ensure the Revel data sync has completed.\n` +
+        `_(${waitMins} minute(s) from now)_`
+      );
+      setTimeout(async () => {
+        await send(OWNER_ID, `🛒 Generating supplier orders now...`);
+        await generateSupplierOrders();
+      }, waitMins * 60 * 1000);
+    } else {
+      await send(OWNER_ID,
+        `${icon} *${storeName}* submitted. ✅\n\n` +
+        `🎉 *All 4 stores have submitted their inventory!*\n` +
+        `Generating supplier orders now...`
+      );
+      await generateSupplierOrders();
+    }
+
   } else {
     await send(OWNER_ID,
       `${icon} *${storeName}* submitted. ✅\n` +
@@ -465,7 +486,6 @@ async function generateSupplierOrders() {
 // ── Generate and send Mega Mart PDF PO ───────────────────────
 async function generateAndSendMegaMartPO(supplier) {
   try {
-    // Calculate combined kg from all stores
     const beefItem = supplier.items.find(i =>
       i.name.toLowerCase().includes('beef short rib')
     );
@@ -486,12 +506,9 @@ async function generateAndSendMegaMartPO(supplier) {
       return;
     }
 
-    const quantity = totalKg + 'kg';
-
-    // Call SheetWriter to generate PDF
     const result = await callSheetWriter({
       action:   'generateMegaMartPO',
-      quantity: quantity,
+      quantity: totalKg + 'kg',
       item:     'Beef Short Ribs',
     });
 
@@ -500,10 +517,9 @@ async function generateAndSendMegaMartPO(supplier) {
       return;
     }
 
-    // Send PDF to Village Plaza and Owner
     const caption =
       `📄 *Mega Mart Purchase Order ${result.poNum}*\n` +
-      `Beef Short Ribs: ${quantity}\n` +
+      `Beef Short Ribs: ${totalKg}kg\n` +
       `_Attach this PDF to your email before sending._`;
 
     await sendPdfToAll(result.pdfBase64, result.fileName, caption);
@@ -781,6 +797,7 @@ app.get('/simulate-all-done', async (req, res) => {
   weekComplete = true;
   res.json({ ok: true, message: 'Simulating all stores done — generating supplier orders...' });
   await send(OWNER_ID, `🧪 *[TEST] Simulating all 4 stores submitted.*\nGenerating supplier orders now...`);
+  // Bypass time check for simulation
   await generateSupplierOrders();
 });
 
