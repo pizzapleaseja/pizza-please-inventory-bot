@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v1.7
-// All orders sent as Telegram messages to Village + Owner
+// PIZZA PLEASE — INVENTORY BOT v1.9
+// Adds Mega Mart PDF purchase order generation
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -144,6 +144,60 @@ async function callSheetWriter(payload) {
   return res.json();
 }
 
+// ── Send PDF file to Telegram ─────────────────────────────────
+async function sendPdfToChat(chatId, base64Data, fileName, caption) {
+  try {
+    const buffer   = Buffer.from(base64Data, 'base64');
+    const boundary = '----TelegramBotBoundary';
+    const CRLF     = '\r\n';
+
+    let bodyParts = '';
+    bodyParts += `--${boundary}${CRLF}`;
+    bodyParts += `Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`;
+    bodyParts += `${chatId}${CRLF}`;
+
+    if (caption) {
+      bodyParts += `--${boundary}${CRLF}`;
+      bodyParts += `Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`;
+      bodyParts += `${caption}${CRLF}`;
+    }
+
+    const headerStr = bodyParts;
+    const fileHeader =
+      `--${boundary}${CRLF}` +
+      `Content-Disposition: form-data; name="document"; filename="${fileName}"${CRLF}` +
+      `Content-Type: application/pdf${CRLF}${CRLF}`;
+    const footer = `${CRLF}--${boundary}--${CRLF}`;
+
+    const headerBuf = Buffer.from(headerStr + fileHeader, 'utf8');
+    const footerBuf = Buffer.from(footer, 'utf8');
+    const body      = Buffer.concat([headerBuf, buffer, footerBuf]);
+
+    await fetch(`${BASE_URL}/sendDocument`, {
+      method:  'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body:    body,
+    }).catch(e => console.error('sendPdf error:', e));
+  } catch (err) {
+    console.error('sendPdfToChat error:', err);
+  }
+}
+
+async function sendPdfToAll(base64Data, fileName, caption) {
+  const villageChatId = knownChatIds['village'];
+  if (villageChatId) await sendPdfToChat(villageChatId, base64Data, fileName, caption);
+  await sendPdfToChat(OWNER_ID, base64Data, fileName, caption);
+}
+
+// ── Parse kg quantity from text ───────────────────────────────
+// Extracts numeric value from strings like "5 KG", "10kg", "5Kg" etc.
+function parseKg(text) {
+  if (!text) return 0;
+  const match = String(text).match(/(\d+(?:\.\d+)?)/);
+  return match ? parseFloat(match[1]) : 0;
+}
+
+// ── Load items ────────────────────────────────────────────────
 async function loadItems(store) {
   if (itemCache[store]) return itemCache[store];
   const result = await callSheetWriter({ action: 'getItems', store });
@@ -325,6 +379,7 @@ async function finishSubmission(chatId, session) {
   }
 }
 
+// ── Generate supplier orders ──────────────────────────────────
 async function generateSupplierOrders() {
   const result = await callSheetWriter({ action: 'getOrderData' });
   if (!result.ok) {
@@ -365,6 +420,7 @@ async function generateSupplierOrders() {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
+      // ── EMAIL ──
       if (contact.includes('email')) {
         const emailMsg =
           `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
@@ -376,8 +432,14 @@ async function generateSupplierOrders() {
           msg.text;
         await sendToAll(emailMsg);
         emailCount++;
+
+        // ── MEGA MART: generate PDF purchase order ──
+        if (supplierName.toLowerCase().includes('mega mart')) {
+          await generateAndSendMegaMartPO(supplier);
+        }
       }
 
+      // ── WHATSAPP ──
       if (contact.includes('whatsapp')) {
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
@@ -400,6 +462,59 @@ async function generateSupplierOrders() {
   );
 }
 
+// ── Generate and send Mega Mart PDF PO ───────────────────────
+async function generateAndSendMegaMartPO(supplier) {
+  try {
+    // Calculate combined kg from all stores
+    const beefItem = supplier.items.find(i =>
+      i.name.toLowerCase().includes('beef short rib')
+    );
+
+    if (!beefItem) {
+      await send(OWNER_ID, `⚠️ Mega Mart: Beef Short Ribs not found in order data.`);
+      return;
+    }
+
+    const totalKg =
+      parseKg(beefItem.village) +
+      parseKg(beefItem.wf) +
+      parseKg(beefItem.lig) +
+      parseKg(beefItem.ochi);
+
+    if (totalKg === 0) {
+      await send(OWNER_ID, `⚠️ Mega Mart: Total quantity is 0 — skipping PO generation.`);
+      return;
+    }
+
+    const quantity = totalKg + 'kg';
+
+    // Call SheetWriter to generate PDF
+    const result = await callSheetWriter({
+      action:   'generateMegaMartPO',
+      quantity: quantity,
+      item:     'Beef Short Ribs',
+    });
+
+    if (!result.ok) {
+      await send(OWNER_ID, `⚠️ Mega Mart PO generation failed: ${result.error}`);
+      return;
+    }
+
+    // Send PDF to Village Plaza and Owner
+    const caption =
+      `📄 *Mega Mart Purchase Order ${result.poNum}*\n` +
+      `Beef Short Ribs: ${quantity}\n` +
+      `_Attach this PDF to your email before sending._`;
+
+    await sendPdfToAll(result.pdfBase64, result.fileName, caption);
+
+  } catch (err) {
+    console.error('generateAndSendMegaMartPO error:', err);
+    await send(OWNER_ID, `⚠️ Error generating Mega Mart PO: ${err.message}`);
+  }
+}
+
+// ── Build order messages ──────────────────────────────────────
 function buildOrderMessages(supplier, delivery, dateStr) {
   const items  = supplier.items;
   const name   = supplier.name;
