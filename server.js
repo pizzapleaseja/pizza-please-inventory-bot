@@ -1,7 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v2.0
-// Adds 8:30 AM safety check before generating supplier orders
-// to ensure Revel sync data is available first
+// PIZZA PLEASE — INVENTORY BOT v2.1
+// Owner receives full inventory summary after each store submits
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -355,26 +354,47 @@ async function finishSubmission(chatId, session) {
   const icon      = STORE_ICONS[store];
   submissions[store] = true;
 
+  // ── Confirm to store ──────────────────────────────────────────────────────
   await send(chatId,
     `✅ *${storeName} inventory submitted!*\n\nThank you! All your counts have been recorded. 🙏`
   );
 
+  // ── Send full summary to owner ────────────────────────────────────────────
+  const items = itemCache[store];
+  if (items) {
+    let summary = `${icon} *${storeName} — Inventory Summary*\n`;
+    summary    += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+    summary    += `📦 *Ingredients:*\n`;
+    for (let i = 0; i < items.ingredients.length; i++) {
+      const val = session.answers.ingredients[i] !== undefined
+        ? session.answers.ingredients[i]
+        : '—';
+      summary += `${items.ingredients[i].name}: *${val}* ${items.ingredients[i].uom}\n`;
+    }
+    summary += `\n🥤 *Drinks:*\n`;
+    for (let i = 0; i < items.drinks.length; i++) {
+      const val = session.answers.drinks[i] !== undefined
+        ? session.answers.drinks[i]
+        : '—';
+      summary += `${items.drinks[i].name}: *${val}* ${items.drinks[i].uom}\n`;
+    }
+    await send(OWNER_ID, summary);
+  }
+
+  // ── Notify owner of pending stores / trigger orders ───────────────────────
   const pending = pendingStores();
 
   if (pending.length === 0 && !weekComplete) {
     weekComplete = true;
 
-    // ── Safety check: wait until 8:30 AM Jamaica time ──────────────────────
-    // Revel sync runs at 7:15 and 7:20 AM. Order formulas depend on that data.
-    // If all stores submit before 8:30 AM, hold the order generation until then.
+    // Safety check: wait until 8:30 AM Jamaica time before generating orders
     const nowJA     = new Date(Date.now() - 5 * 3600000);
     const totalMins = nowJA.getUTCHours() * 60 + nowJA.getUTCMinutes();
-    const safeTime  = 8 * 60 + 30; // 8:30 AM Jamaica time
+    const safeTime  = 8 * 60 + 30; // 8:30 AM Jamaica
 
     if (totalMins < safeTime) {
       const waitMins = safeTime - totalMins;
       await send(OWNER_ID,
-        `${icon} *${storeName}* submitted. ✅\n\n` +
         `🎉 *All 4 stores have submitted their inventory!*\n\n` +
         `⏳ Supplier orders will be generated at *8:30 AM* to ensure the Revel data sync has completed.\n` +
         `_(${waitMins} minute(s) from now)_`
@@ -385,7 +405,6 @@ async function finishSubmission(chatId, session) {
       }, waitMins * 60 * 1000);
     } else {
       await send(OWNER_ID,
-        `${icon} *${storeName}* submitted. ✅\n\n` +
         `🎉 *All 4 stores have submitted their inventory!*\n` +
         `Generating supplier orders now...`
       );
@@ -441,7 +460,6 @@ async function generateSupplierOrders() {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
 
-      // ── EMAIL ──
       if (contact.includes('email')) {
         const emailMsg =
           `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
@@ -454,13 +472,11 @@ async function generateSupplierOrders() {
         await sendToAll(emailMsg);
         emailCount++;
 
-        // ── MEGA MART: generate PDF purchase order ──
         if (supplierName.toLowerCase().includes('mega mart')) {
           await generateAndSendMegaMartPO(supplier);
         }
       }
 
-      // ── WHATSAPP ──
       if (contact.includes('whatsapp')) {
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
@@ -797,7 +813,6 @@ app.get('/simulate-all-done', async (req, res) => {
   weekComplete = true;
   res.json({ ok: true, message: 'Simulating all stores done — generating supplier orders...' });
   await send(OWNER_ID, `🧪 *[TEST] Simulating all 4 stores submitted.*\nGenerating supplier orders now...`);
-  // Bypass time check for simulation
   await generateSupplierOrders();
 });
 
