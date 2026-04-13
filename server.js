@@ -1,6 +1,6 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v2.1
-// Owner receives full inventory summary after each store submits
+// PIZZA PLEASE — INVENTORY BOT v2.2
+// Mega Mart minimum order 10kg enforced
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -367,15 +367,13 @@ async function finishSubmission(chatId, session) {
     summary    += `📦 *Ingredients:*\n`;
     for (let i = 0; i < items.ingredients.length; i++) {
       const val = session.answers.ingredients[i] !== undefined
-        ? session.answers.ingredients[i]
-        : '—';
+        ? session.answers.ingredients[i] : '—';
       summary += `${items.ingredients[i].name}: *${val}* ${items.ingredients[i].uom}\n`;
     }
     summary += `\n🥤 *Drinks:*\n`;
     for (let i = 0; i < items.drinks.length; i++) {
       const val = session.answers.drinks[i] !== undefined
-        ? session.answers.drinks[i]
-        : '—';
+        ? session.answers.drinks[i] : '—';
       summary += `${items.drinks[i].name}: *${val}* ${items.drinks[i].uom}\n`;
     }
     await send(OWNER_ID, summary);
@@ -387,7 +385,6 @@ async function finishSubmission(chatId, session) {
   if (pending.length === 0 && !weekComplete) {
     weekComplete = true;
 
-    // Safety check: wait until 8:30 AM Jamaica time before generating orders
     const nowJA     = new Date(Date.now() - 5 * 3600000);
     const totalMins = nowJA.getUTCHours() * 60 + nowJA.getUTCMinutes();
     const safeTime  = 8 * 60 + 30; // 8:30 AM Jamaica
@@ -511,15 +508,26 @@ async function generateAndSendMegaMartPO(supplier) {
       return;
     }
 
-    const totalKg =
+    const rawKg =
       parseKg(beefItem.village) +
       parseKg(beefItem.wf) +
       parseKg(beefItem.lig) +
       parseKg(beefItem.ochi);
 
-    if (totalKg === 0) {
+    if (rawKg === 0) {
       await send(OWNER_ID, `⚠️ Mega Mart: Total quantity is 0 — skipping PO generation.`);
       return;
+    }
+
+    // ── Enforce 10kg minimum order ────────────────────────────────────────
+    const totalKg = Math.max(rawKg, 10);
+
+    if (totalKg > rawKg) {
+      await send(OWNER_ID,
+        `⚠️ *Mega Mart — Minimum order applied*\n` +
+        `Calculated quantity: ${rawKg}kg\n` +
+        `Order bumped up to minimum: *10kg*`
+      );
     }
 
     const result = await callSheetWriter({
@@ -535,8 +543,9 @@ async function generateAndSendMegaMartPO(supplier) {
 
     const caption =
       `📄 *Mega Mart Purchase Order ${result.poNum}*\n` +
-      `Beef Short Ribs: ${totalKg}kg\n` +
-      `_Attach this PDF to your email before sending._`;
+      `Beef Short Ribs: ${totalKg}kg` +
+      (totalKg > rawKg ? ` _(minimum order applied)_` : '') +
+      `\n_Attach this PDF to your email before sending._`;
 
     await sendPdfToAll(result.pdfBase64, result.fileName, caption);
 
