@@ -1,6 +1,7 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v2.2
-// Mega Mart minimum order 10kg enforced
+// PIZZA PLEASE — INVENTORY BOT v2.3
+// Chicken Sausage & Chicken Ham Sliced: unit→case conversion
+// for Liguanea/Waterfront, consolidated to Village Plaza, max 2 cases
 // ============================================================
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -34,6 +35,17 @@ const STORE_ICONS = {
   liguanea:   '🟡',
   ochorios:   '🔴',
 };
+
+// ── Case conversion rules ─────────────────────────────────────
+// When Liguanea or Waterfront show units for these items,
+// convert to cases and consolidate into Village Plaza order.
+// Max 2 cases total regardless of combined quantity.
+const CASE_CONVERSION_ITEMS = [
+  'chicken sausage',
+  'chicken ham sliced'
+];
+const UNITS_PER_CASE = 50;
+const MAX_CASES      = 2;
 
 const knownChatIds = {};
 const sessions     = {};
@@ -192,6 +204,16 @@ function parseKg(text) {
   if (!text) return 0;
   const match = String(text).match(/(\d+(?:\.\d+)?)/);
   return match ? parseFloat(match[1]) : 0;
+}
+
+// ── Parse units or cases from text ───────────────────────────
+function parseUnitsOrCases(text) {
+  if (!text) return { cases: 0, units: 0, isCase: false };
+  const lower = String(text).toLowerCase();
+  const match = String(text).match(/(\d+(?:\.\d+)?)/);
+  const num   = match ? parseFloat(match[1]) : 0;
+  if (lower.includes('case')) return { cases: num, units: 0, isCase: true };
+  return { cases: 0, units: num, isCase: false };
 }
 
 async function loadItems(store) {
@@ -354,12 +376,10 @@ async function finishSubmission(chatId, session) {
   const icon      = STORE_ICONS[store];
   submissions[store] = true;
 
-  // ── Confirm to store ──────────────────────────────────────────────────────
   await send(chatId,
     `✅ *${storeName} inventory submitted!*\n\nThank you! All your counts have been recorded. 🙏`
   );
 
-  // ── Send full summary to owner ────────────────────────────────────────────
   const items = itemCache[store];
   if (items) {
     let summary = `${icon} *${storeName} — Inventory Summary*\n`;
@@ -379,7 +399,6 @@ async function finishSubmission(chatId, session) {
     await send(OWNER_ID, summary);
   }
 
-  // ── Notify owner of pending stores / trigger orders ───────────────────────
   const pending = pendingStores();
 
   if (pending.length === 0 && !weekComplete) {
@@ -387,7 +406,7 @@ async function finishSubmission(chatId, session) {
 
     const nowJA     = new Date(Date.now() - 5 * 3600000);
     const totalMins = nowJA.getUTCHours() * 60 + nowJA.getUTCMinutes();
-    const safeTime  = 8 * 60 + 30; // 8:30 AM Jamaica
+    const safeTime  = 8 * 60 + 30;
 
     if (totalMins < safeTime) {
       const waitMins = safeTime - totalMins;
@@ -416,7 +435,6 @@ async function finishSubmission(chatId, session) {
   }
 }
 
-// ── Generate supplier orders ──────────────────────────────────
 async function generateSupplierOrders() {
   const result = await callSheetWriter({ action: 'getOrderData' });
   if (!result.ok) {
@@ -496,7 +514,6 @@ async function generateSupplierOrders() {
   );
 }
 
-// ── Generate and send Mega Mart PDF PO ───────────────────────
 async function generateAndSendMegaMartPO(supplier) {
   try {
     const beefItem = supplier.items.find(i =>
@@ -519,7 +536,6 @@ async function generateAndSendMegaMartPO(supplier) {
       return;
     }
 
-    // ── Enforce 10kg minimum order ────────────────────────────────────────
     const totalKg = Math.max(rawKg, 10);
 
     if (totalKg > rawKg) {
@@ -564,27 +580,61 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     `Supplier: ${name}\n` +
     `Date: ${dateStr}\n\n`;
 
+  // ── Apply case conversion for Chicken Sausage & Chicken Ham Sliced ───────
+  const processedItems = items.map(item => {
+    const lowerName       = item.name.toLowerCase();
+    const needsConversion = CASE_CONVERSION_ITEMS.some(n => lowerName.includes(n));
+    if (!needsConversion) return item;
+
+    // Parse Village Plaza existing cases
+    const villageVal = parseUnitsOrCases(item.village);
+    let villageCases = villageVal.isCase ? villageVal.cases : 0;
+
+    // Convert Liguanea units → cases, add to Village Plaza
+    const ligVal = parseUnitsOrCases(item.lig);
+    if (!ligVal.isCase && ligVal.units >= UNITS_PER_CASE) {
+      villageCases += Math.floor(ligVal.units / UNITS_PER_CASE);
+    }
+
+    // Convert Waterfront units → cases, add to Village Plaza
+    const wfVal = parseUnitsOrCases(item.wf);
+    if (!wfVal.isCase && wfVal.units >= UNITS_PER_CASE) {
+      villageCases += Math.floor(wfVal.units / UNITS_PER_CASE);
+    }
+
+    // Cap at maximum 2 cases
+    villageCases = Math.min(villageCases, MAX_CASES);
+
+    return {
+      ...item,
+      village: villageCases > 0 ? `${villageCases} Case${villageCases > 1 ? 's' : ''}` : '',
+      wf:      '',
+      lig:     '',
+      // ochi stays as is
+    };
+  });
+
   if (delivery.includes('direct')) {
     let body = header + `Please prepare the following order for delivery to each location:\n\n`;
-    const villageItems = items.filter(i => i.village);
+    const villageItems = processedItems.filter(i => i.village);
     if (villageItems.length > 0) {
       body += `Village Plaza\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
       villageItems.forEach(i => { body += `  ${i.name}: ${i.village}\n`; });
       body += '\n';
     }
-    const wfItems = items.filter(i => i.wf);
+    const wfItems = processedItems.filter(i => i.wf);
     if (wfItems.length > 0) {
       body += `Waterfront\n${supplier.addrWaterfront ? supplier.addrWaterfront + '\n' : ''}`;
       wfItems.forEach(i => { body += `  ${i.name}: ${i.wf}\n`; });
       body += '\n';
     }
-    const ligItems = items.filter(i => i.lig);
+    const ligItems = processedItems.filter(i => i.lig);
     if (ligItems.length > 0) {
       body += `Liguanea\n${supplier.addrLiguanea ? supplier.addrLiguanea + '\n' : ''}`;
       ligItems.forEach(i => { body += `  ${i.name}: ${i.lig}\n`; });
       body += '\n';
     }
-    const ochiItems = items.filter(i => i.ochi);
+    const ochiItems = processedItems.filter(i => i.ochi);
     if (ochiItems.length > 0) {
       body += `Ocho Rios\n${supplier.addrOchoRios ? supplier.addrOchoRios + '\n' : ''}`;
       ochiItems.forEach(i => { body += `  ${i.name}: ${i.ochi}\n`; });
@@ -595,8 +645,8 @@ function buildOrderMessages(supplier, delivery, dateStr) {
   }
 
   const messages      = [];
-  const kingstonItems = items.filter(i => i.village || i.wf || i.lig);
-  const ochiItems2    = items.filter(i => i.ochi);
+  const kingstonItems = processedItems.filter(i => i.village || i.wf || i.lig);
+  const ochiItems2    = processedItems.filter(i => i.ochi);
 
   if (kingstonItems.length > 0) {
     let body = header +
@@ -624,7 +674,7 @@ function buildOrderMessages(supplier, delivery, dateStr) {
 
   if (messages.length === 0) {
     let body = header;
-    items.forEach(i => {
+    processedItems.forEach(i => {
       body += `${i.name}:\n`;
       if (i.village) body += `  Village Plaza: ${i.village}\n`;
       if (i.wf)      body += `  Waterfront:    ${i.wf}\n`;
