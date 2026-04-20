@@ -1,11 +1,11 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v2.3
-// Chicken Sausage & Chicken Ham Sliced: unit→case conversion
-// for Liguanea/Waterfront, consolidated to Village Plaza, max 2 cases
+// PIZZA PLEASE — INVENTORY BOT v2.4
+// Hardcoded chat IDs — no registration required
+// Fixed sendToAll to use reverse lookup for Village Plaza
 // ============================================================
-const express = require('express');
-const fetch   = require('node-fetch');
 
+const express = require('express');
+const fetch = require('node-fetch');
 const app = express();
 app.use(express.json());
 
@@ -15,12 +15,19 @@ const SHEET_SECRET     = process.env.SHEET_SECRET || 'PizzaInventory2026$';
 const OWNER_ID         = process.env.OWNER_CHAT_ID || '5766630052';
 const BASE_URL         = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-const STAFF = {
-  'pizzapleasevillage':    'village',
-  'pizzapleasewaterfront': 'waterfront',
-  'pizzapleaseliguanea':   'liguanea',
-  'pizzapleaseochorios':   'ochorios',
+// ── HARDCODED CHAT IDs — NO REGISTRATION REQUIRED ────────────
+// Key: Telegram chat ID, Value: store key
+const knownChatIds = {
+  '8649046356': 'village',    // Village Plaza
+  '8756511446': 'liguanea',   // Liguanea
+  '8354515202': 'waterfront', // Waterfront
+  '8753758393': 'ochorios',   // Ocho Rios
 };
+
+// ── Reverse lookup: store key → chat ID ──────────────────────
+function getChatIdForStore(storeKey) {
+  return Object.keys(knownChatIds).find(id => knownChatIds[id] === storeKey) || null;
+}
 
 const STORE_NAMES = {
   village:    'Village Plaza',
@@ -37,9 +44,6 @@ const STORE_ICONS = {
 };
 
 // ── Case conversion rules ─────────────────────────────────────
-// When Liguanea or Waterfront show units for these items,
-// convert to cases and consolidate into Village Plaza order.
-// Max 2 cases total regardless of combined quantity.
 const CASE_CONVERSION_ITEMS = [
   'chicken sausage',
   'chicken ham sliced'
@@ -47,16 +51,15 @@ const CASE_CONVERSION_ITEMS = [
 const UNITS_PER_CASE = 50;
 const MAX_CASES      = 2;
 
-const knownChatIds = {};
-const sessions     = {};
-const submissions  = {};
-const itemCache    = {};
-const processed    = new Set();
-let weekComplete   = false;
-
+const sessions  = {};
+const submissions = {};
+const itemCache = {};
+const processed = new Set();
+let weekComplete = false;
 const queues     = {};
 const processing = {};
 
+// ── Queue system ──────────────────────────────────────────────
 async function enqueue(chatId, msg, type) {
   if (!queues[chatId]) queues[chatId] = [];
   queues[chatId].push({ msg, type });
@@ -78,11 +81,11 @@ async function drainQueue(chatId) {
   processing[chatId] = false;
 }
 
+// ── Get store from hardcoded chat ID ──────────────────────────
 function getStore(from, chatId) {
   chatId = String(chatId);
-  if (chatId === OWNER_ID) return 'village';
-  const username = from && from.username ? from.username.toLowerCase() : null;
-  if (username && STAFF[username]) return STAFF[username];
+  if (knownChatIds[chatId]) return knownChatIds[chatId];
+  if (chatId === OWNER_ID)  return 'village';
   return null;
 }
 
@@ -95,8 +98,9 @@ function pendingStores() {
   return Object.keys(STORE_NAMES).filter(s => !submissions[s]);
 }
 
+// ── Send to Village Plaza + Owner ─────────────────────────────
 async function sendToAll(text) {
-  const villageChatId = knownChatIds['village'];
+  const villageChatId = getChatIdForStore('village');
   if (villageChatId) await send(villageChatId, text);
   await send(OWNER_ID, text);
 }
@@ -162,28 +166,23 @@ async function sendPdfToChat(chatId, base64Data, fileName, caption) {
     const buffer   = Buffer.from(base64Data, 'base64');
     const boundary = '----TelegramBotBoundary';
     const CRLF     = '\r\n';
-
-    let bodyParts = '';
+    let bodyParts  = '';
     bodyParts += `--${boundary}${CRLF}`;
     bodyParts += `Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`;
     bodyParts += `${chatId}${CRLF}`;
-
     if (caption) {
       bodyParts += `--${boundary}${CRLF}`;
       bodyParts += `Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`;
       bodyParts += `${caption}${CRLF}`;
     }
-
     const fileHeader =
       `--${boundary}${CRLF}` +
       `Content-Disposition: form-data; name="document"; filename="${fileName}"${CRLF}` +
       `Content-Type: application/pdf${CRLF}${CRLF}`;
-    const footer = `${CRLF}--${boundary}--${CRLF}`;
-
+    const footer    = `${CRLF}--${boundary}--${CRLF}`;
     const headerBuf = Buffer.from(bodyParts + fileHeader, 'utf8');
     const footerBuf = Buffer.from(footer, 'utf8');
     const body      = Buffer.concat([headerBuf, buffer, footerBuf]);
-
     await fetch(`${BASE_URL}/sendDocument`, {
       method:  'POST',
       headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
@@ -195,7 +194,7 @@ async function sendPdfToChat(chatId, base64Data, fileName, caption) {
 }
 
 async function sendPdfToAll(base64Data, fileName, caption) {
-  const villageChatId = knownChatIds['village'];
+  const villageChatId = getChatIdForStore('village');
   if (villageChatId) await sendPdfToChat(villageChatId, base64Data, fileName, caption);
   await sendPdfToChat(OWNER_ID, base64Data, fileName, caption);
 }
@@ -206,7 +205,6 @@ function parseKg(text) {
   return match ? parseFloat(match[1]) : 0;
 }
 
-// ── Parse units or cases from text ───────────────────────────
 function parseUnitsOrCases(text) {
   if (!text) return { cases: 0, units: 0, isCase: false };
   const lower = String(text).toLowerCase();
@@ -251,19 +249,16 @@ async function showReview(chatId, session, type) {
   session.phase    = type === 'ingredients' ? 'review_ingredients' : 'review_drinks';
   session.editing  = null;
   sessions[chatId] = session;
-
   const items   = type === 'ingredients'
     ? itemCache[session.store].ingredients
     : itemCache[session.store].drinks;
   const answers = type === 'ingredients'
     ? session.answers.ingredients
     : session.answers.drinks;
-
   const emoji = type === 'ingredients' ? '📦' : '🥤';
   const label = type === 'ingredients' ? 'Ingredients' : 'Drinks';
-
-  let msg = `${emoji} *${label} Review — ${STORE_NAMES[session.store]}*\n`;
-  msg    += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+  let msg  = `${emoji} *${label} Review — ${STORE_NAMES[session.store]}*\n`;
+  msg     += `━━━━━━━━━━━━━━━━━━━━━━\n`;
   for (let i = 0; i < items.length; i++) {
     const val = answers[i] !== undefined ? answers[i] : '—';
     msg += `*${i + 1}.* ${items[i].name}: *${val}* ${items[i].uom}\n`;
@@ -273,7 +268,6 @@ async function showReview(chatId, session, type) {
   msg += type === 'ingredients'
     ? `When ready, tap ✅ *Confirm* to proceed to drinks.`
     : `When ready, tap ✅ *Confirm* to submit your inventory.`;
-
   await sendKb(chatId, msg, [
     [{ text: `✅ Confirm ${label}`, callback_data: `CONFIRM_${type.toUpperCase()}` }]
   ]);
@@ -285,10 +279,8 @@ async function handleAnswer(chatId, session, text) {
     await send(chatId, `⚠️ Please enter a number only. Try again:`);
     return;
   }
-
   const type         = session.phase;
   const indexToWrite = session.itemIndex;
-
   const result = await callSheetWriter({
     action:   'writeCount',
     store:    session.store,
@@ -296,18 +288,15 @@ async function handleAnswer(chatId, session, text) {
     rowIndex: indexToWrite,
     value:    value,
   });
-
   if (!result.ok) {
     await send(chatId, `⚠️ Error saving count: ${result.error}. Please try again.`);
     return;
   }
-
   if (type === 'ingredients') {
     session.answers.ingredients[indexToWrite] = value;
   } else {
     session.answers.drinks[indexToWrite] = value;
   }
-
   session.itemIndex++;
   sessions[chatId] = session;
   await askNextItem(chatId, session);
@@ -318,7 +307,6 @@ async function handleReviewEdit(chatId, session, text) {
   const items = type === 'ingredients'
     ? itemCache[session.store].ingredients
     : itemCache[session.store].drinks;
-
   if (session.editing !== null) {
     const value = parseFloat(text.replace(/,/g, ''));
     if (isNaN(value) || value < 0) {
@@ -326,7 +314,7 @@ async function handleReviewEdit(chatId, session, text) {
       return;
     }
     const editIndex = session.editing;
-    const result    = await callSheetWriter({
+    const result = await callSheetWriter({
       action:   'writeCount',
       store:    session.store,
       type:     type === 'ingredients' ? 'ingredient' : 'drink',
@@ -337,18 +325,14 @@ async function handleReviewEdit(chatId, session, text) {
       await send(chatId, `⚠️ Error saving: ${result.error}. Try again.`);
       return;
     }
-    if (type === 'ingredients') {
-      session.answers.ingredients[editIndex] = value;
-    } else {
-      session.answers.drinks[editIndex] = value;
-    }
+    if (type === 'ingredients') session.answers.ingredients[editIndex] = value;
+    else session.answers.drinks[editIndex] = value;
     session.editing  = null;
     sessions[chatId] = session;
     await send(chatId, `✅ *${items[editIndex].name}* updated to *${value}*`);
     await showReview(chatId, session, type);
     return;
   }
-
   const num = parseInt(text);
   if (isNaN(num) || num < 1 || num > items.length) {
     await send(chatId,
@@ -356,10 +340,9 @@ async function handleReviewEdit(chatId, session, text) {
     );
     return;
   }
-
   session.editing  = num - 1;
   sessions[chatId] = session;
-  const answers    = type === 'ingredients' ? session.answers.ingredients : session.answers.drinks;
+  const answers = type === 'ingredients' ? session.answers.ingredients : session.answers.drinks;
   await send(chatId,
     `✏️ Editing *${items[num - 1].name}*\n` +
     `Current value: *${answers[num - 1] !== undefined ? answers[num - 1] : '—'}* ${items[num - 1].uom}\n\n` +
@@ -370,7 +353,6 @@ async function handleReviewEdit(chatId, session, text) {
 async function finishSubmission(chatId, session) {
   session.phase    = 'done';
   sessions[chatId] = session;
-
   const store     = session.store;
   const storeName = STORE_NAMES[store];
   const icon      = STORE_ICONS[store];
@@ -380,11 +362,12 @@ async function finishSubmission(chatId, session) {
     `✅ *${storeName} inventory submitted!*\n\nThank you! All your counts have been recorded. 🙏`
   );
 
+  // ── Send full summary to owner ────────────────────────────────────────────
   const items = itemCache[store];
   if (items) {
-    let summary = `${icon} *${storeName} — Inventory Summary*\n`;
-    summary    += `━━━━━━━━━━━━━━━━━━━━━━\n`;
-    summary    += `📦 *Ingredients:*\n`;
+    let summary  = `${icon} *${storeName} — Inventory Summary*\n`;
+    summary     += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+    summary     += `📦 *Ingredients:*\n`;
     for (let i = 0; i < items.ingredients.length; i++) {
       const val = session.answers.ingredients[i] !== undefined
         ? session.answers.ingredients[i] : '—';
@@ -400,14 +383,11 @@ async function finishSubmission(chatId, session) {
   }
 
   const pending = pendingStores();
-
   if (pending.length === 0 && !weekComplete) {
     weekComplete = true;
-
     const nowJA     = new Date(Date.now() - 5 * 3600000);
     const totalMins = nowJA.getUTCHours() * 60 + nowJA.getUTCMinutes();
     const safeTime  = 8 * 60 + 30;
-
     if (totalMins < safeTime) {
       const waitMins = safeTime - totalMins;
       await send(OWNER_ID,
@@ -421,12 +401,10 @@ async function finishSubmission(chatId, session) {
       }, waitMins * 60 * 1000);
     } else {
       await send(OWNER_ID,
-        `🎉 *All 4 stores have submitted their inventory!*\n` +
-        `Generating supplier orders now...`
+        `🎉 *All 4 stores have submitted their inventory!*\nGenerating supplier orders now...`
       );
       await generateSupplierOrders();
     }
-
   } else {
     await send(OWNER_ID,
       `${icon} *${storeName}* submitted. ✅\n` +
@@ -435,46 +413,38 @@ async function finishSubmission(chatId, session) {
   }
 }
 
+// ── Generate supplier orders ──────────────────────────────────
 async function generateSupplierOrders() {
   const result = await callSheetWriter({ action: 'getOrderData' });
   if (!result.ok) {
     await send(OWNER_ID, `⚠️ Failed to read order data: ${result.error}`);
     return;
   }
-
   const suppliers = result.suppliers;
-
   if (!suppliers || Object.keys(suppliers).length === 0) {
     await send(OWNER_ID,
-      `⚠️ No orders found in ORD TOT tab.\n` +
-      `Please check that order quantities are filled in columns B–E.`
+      `⚠️ No orders found in ORD TOT tab.\nPlease check that order quantities are filled in columns B–E.`
     );
     return;
   }
-
   const dateStr = new Date().toLocaleDateString('en-US', {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
   });
-
   let emailCount    = 0;
   let whatsappCount = 0;
-
   await sendToAll(
     `🛒 *Supplier Orders — ${dateStr}*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
     `📧 = Email order (copy/paste into pizzapleaseordering@gmail.com)\n` +
     `💬 = WhatsApp order (copy/paste and send)`
   );
-
   for (const [supplierName, supplier] of Object.entries(suppliers)) {
     const contact  = (supplier.contactMethod || '').toLowerCase();
     const delivery = (supplier.delivery      || '').toLowerCase();
     const messages = buildOrderMessages(supplier, delivery, dateStr);
-
     for (const msg of messages) {
       const label   = msg.label ? ` (${msg.label})` : '';
       const subject = `Order Request — ${supplierName}${label} — ${dateStr}`;
-
       if (contact.includes('email')) {
         const emailMsg =
           `📧 *EMAIL ORDER — ${supplierName}*${label}\n` +
@@ -486,12 +456,10 @@ async function generateSupplierOrders() {
           msg.text;
         await sendToAll(emailMsg);
         emailCount++;
-
         if (supplierName.toLowerCase().includes('mega mart')) {
           await generateAndSendMegaMartPO(supplier);
         }
       }
-
       if (contact.includes('whatsapp')) {
         const waMsg =
           `💬 *WHATSAPP ORDER — ${supplierName}*${label}\n` +
@@ -506,7 +474,6 @@ async function generateSupplierOrders() {
       }
     }
   }
-
   await sendToAll(
     `✅ *All supplier orders generated!*\n\n` +
     `📧 ${emailCount} email order(s) — copy/paste into pizzapleaseordering@gmail.com\n` +
@@ -514,30 +481,26 @@ async function generateSupplierOrders() {
   );
 }
 
+// ── Generate and send Mega Mart PDF PO ───────────────────────
 async function generateAndSendMegaMartPO(supplier) {
   try {
     const beefItem = supplier.items.find(i =>
       i.name.toLowerCase().includes('beef short rib')
     );
-
     if (!beefItem) {
       await send(OWNER_ID, `⚠️ Mega Mart: Beef Short Ribs not found in order data.`);
       return;
     }
-
     const rawKg =
       parseKg(beefItem.village) +
       parseKg(beefItem.wf) +
       parseKg(beefItem.lig) +
       parseKg(beefItem.ochi);
-
     if (rawKg === 0) {
       await send(OWNER_ID, `⚠️ Mega Mart: Total quantity is 0 — skipping PO generation.`);
       return;
     }
-
     const totalKg = Math.max(rawKg, 10);
-
     if (totalKg > rawKg) {
       await send(OWNER_ID,
         `⚠️ *Mega Mart — Minimum order applied*\n` +
@@ -545,26 +508,21 @@ async function generateAndSendMegaMartPO(supplier) {
         `Order bumped up to minimum: *10kg*`
       );
     }
-
     const result = await callSheetWriter({
       action:   'generateMegaMartPO',
       quantity: totalKg + 'kg',
       item:     'Beef Short Ribs',
     });
-
     if (!result.ok) {
       await send(OWNER_ID, `⚠️ Mega Mart PO generation failed: ${result.error}`);
       return;
     }
-
     const caption =
       `📄 *Mega Mart Purchase Order ${result.poNum}*\n` +
       `Beef Short Ribs: ${totalKg}kg` +
       (totalKg > rawKg ? ` _(minimum order applied)_` : '') +
       `\n_Attach this PDF to your email before sending._`;
-
     await sendPdfToAll(result.pdfBase64, result.fileName, caption);
-
   } catch (err) {
     console.error('generateAndSendMegaMartPO error:', err);
     await send(OWNER_ID, `⚠️ Error generating Mega Mart PO: ${err.message}`);
@@ -580,42 +538,30 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     `Supplier: ${name}\n` +
     `Date: ${dateStr}\n\n`;
 
-  // ── Apply case conversion for Chicken Sausage & Chicken Ham Sliced ───────
+  // ── Case conversion for Chicken Sausage & Chicken Ham Sliced ─────────────
   const processedItems = items.map(item => {
     const lowerName       = item.name.toLowerCase();
     const needsConversion = CASE_CONVERSION_ITEMS.some(n => lowerName.includes(n));
     if (!needsConversion) return item;
-
-    // Parse Village Plaza existing cases
     const villageVal = parseUnitsOrCases(item.village);
     let villageCases = villageVal.isCase ? villageVal.cases : 0;
-
-    // Convert Liguanea units → cases, add to Village Plaza
-    const ligVal = parseUnitsOrCases(item.lig);
-    if (!ligVal.isCase && ligVal.units >= UNITS_PER_CASE) {
+    const ligVal     = parseUnitsOrCases(item.lig);
+    if (!ligVal.isCase && ligVal.units >= UNITS_PER_CASE)
       villageCases += Math.floor(ligVal.units / UNITS_PER_CASE);
-    }
-
-    // Convert Waterfront units → cases, add to Village Plaza
     const wfVal = parseUnitsOrCases(item.wf);
-    if (!wfVal.isCase && wfVal.units >= UNITS_PER_CASE) {
+    if (!wfVal.isCase && wfVal.units >= UNITS_PER_CASE)
       villageCases += Math.floor(wfVal.units / UNITS_PER_CASE);
-    }
-
-    // Cap at maximum 2 cases
     villageCases = Math.min(villageCases, MAX_CASES);
-
     return {
       ...item,
       village: villageCases > 0 ? `${villageCases} Case${villageCases > 1 ? 's' : ''}` : '',
-      wf:      '',
-      lig:     '',
-      // ochi stays as is
+      wf:  '',
+      lig: '',
     };
   });
 
   if (delivery.includes('direct')) {
-    let body = header + `Please prepare the following order for delivery to each location:\n\n`;
+    let body       = header + `Please prepare the following order for delivery to each location:\n\n`;
     const villageItems = processedItems.filter(i => i.village);
     if (villageItems.length > 0) {
       body += `Village Plaza\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
@@ -694,23 +640,14 @@ async function sendMondayPrompt() {
   Object.keys(submissions).forEach(k => delete submissions[k]);
   Object.keys(sessions).forEach(k   => delete sessions[k]);
   Object.keys(itemCache).forEach(k  => delete itemCache[k]);
-
-  let sent = 0;
-  for (const [store, chatId] of Object.entries(knownChatIds)) {
+  for (const [chatId, store] of Object.entries(knownChatIds)) {
     await send(chatId,
       `🍕 *Good morning ${STORE_NAMES[store]}!*\n\n` +
       `It's Monday — time to submit your weekly inventory count.\n\n` +
       `Type *START* when you're ready to begin.`
     );
-    sent++;
   }
-
-  const missing = Object.keys(STORE_NAMES).filter(s => !knownChatIds[s]);
-  let ownerMsg  = `📋 Monday inventory prompt sent to ${sent} store(s).`;
-  if (missing.length > 0) {
-    ownerMsg += `\n⚠️ Could not reach: *${missing.map(s => STORE_NAMES[s]).join(', ')}*`;
-  }
-  await send(OWNER_ID, ownerMsg);
+  await send(OWNER_ID, `📋 Monday inventory prompt sent to all 4 stores.`);
 }
 
 app.post('/webhook', async (req, res) => {
@@ -734,7 +671,7 @@ app.post('/webhook', async (req, res) => {
 
 async function handleMessage(msg) {
   const chatId = String(msg.chat.id);
-  const text   = (msg.text || '').trim();
+  const text   = (msg.text || '').trim().toUpperCase();
   const store  = getStore(msg.from, chatId);
 
   if (!store) {
@@ -747,17 +684,14 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (!knownChatIds[store]) {
-    knownChatIds[store] = chatId;
-    console.log(`Registered ${STORE_NAMES[store]}: ${chatId}`);
-    await send(OWNER_ID,
-      `📌 *${STORE_NAMES[store]}* registered on the inventory bot.\n_Chat ID: ${chatId}_`
-    );
+  // ── Strict START rule ─────────────────────────────────────────────────────
+  if (!sessions[chatId] && text !== 'START') {
+    await send(chatId, `⚠️ Please type *START* to begin sending today's inventory numbers.`);
+    return;
   }
 
-  const upper = text.toUpperCase();
-
-  if (upper === 'START') {
+  // ── START ─────────────────────────────────────────────────────────────────
+  if (text === 'START') {
     if (sessions[chatId] && sessions[chatId].phase === 'done') {
       await send(chatId, `✅ Already submitted this week. Type *RESTART* to redo.`);
       return;
@@ -789,29 +723,30 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (upper === 'RESTART') {
+  // ── RESTART ───────────────────────────────────────────────────────────────
+  if (text === 'RESTART') {
     delete sessions[chatId];
     delete submissions[store];
     await send(chatId, `🔄 Session reset. Type *START* to begin again.`);
     return;
   }
 
-  if (upper === '/STATUS' && chatId === OWNER_ID) {
+  // ── /STATUS (owner only) ──────────────────────────────────────────────────
+  if (text === '/STATUS' && chatId === OWNER_ID) {
     let statusMsg = `📊 *Inventory Status — ${todayJA()}*\n\n`;
     Object.keys(STORE_NAMES).forEach(s => {
       statusMsg += (submissions[s] ? '✅' : '⏳') + ' ' + STORE_NAMES[s] + '\n';
     });
-    statusMsg += `\n📌 Registered: ${Object.keys(knownChatIds).map(s => STORE_NAMES[s]).join(', ') || 'none'}`;
     await send(chatId, statusMsg);
     return;
   }
 
+  // ── Normal flow ───────────────────────────────────────────────────────────
   const session = sessions[chatId];
   if (!session || session.phase === 'done') {
     await send(chatId, `Type *START* to begin your inventory submission.`);
     return;
   }
-
   if (session.phase === 'ingredients' || session.phase === 'drinks') {
     await handleAnswer(chatId, session, text);
   } else if (session.phase === 'review_ingredients' || session.phase === 'review_drinks') {
@@ -823,13 +758,10 @@ async function handleCallback(query) {
   const chatId = String(query.message.chat.id);
   const data   = query.data;
   const store  = getStore(query.from, chatId);
-
   await answerCb(query.id);
   if (!store) return;
-
   const session = sessions[chatId];
   if (!session) return;
-
   if (data === 'CONFIRM_INGREDIENTS') {
     session.phase     = 'drinks';
     session.itemIndex = 0;
@@ -842,7 +774,6 @@ async function handleCallback(query) {
     await askNextItem(chatId, session);
     return;
   }
-
   if (data === 'CONFIRM_DRINKS') {
     await finishSubmission(chatId, session);
     return;
@@ -863,7 +794,7 @@ app.get('/reset', (req, res) => {
   Object.keys(sessions).forEach(k   => delete sessions[k]);
   Object.keys(itemCache).forEach(k  => delete itemCache[k]);
   weekComplete = false;
-  res.send('Reset complete. knownChatIds preserved.');
+  res.send('Reset complete.');
 });
 
 app.get('/simulate-all-done', async (req, res) => {
