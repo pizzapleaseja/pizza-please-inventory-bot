@@ -85,7 +85,6 @@ async function drainQueue(chatId) {
 function getStore(from, chatId) {
   chatId = String(chatId);
   if (knownChatIds[chatId]) return knownChatIds[chatId];
-  if (chatId === OWNER_ID)  return 'village';
   return null;
 }
 
