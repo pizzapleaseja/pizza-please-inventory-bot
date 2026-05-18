@@ -1,12 +1,17 @@
 // ============================================================
-// PIZZA PLEASE — INVENTORY BOT v2.4
-// Hardcoded chat IDs — no registration required
-// Fixed sendToAll to use reverse lookup for Village Plaza
+// PIZZA PLEASE — INVENTORY BOT v2.5
+// Fixes:
+// 1. OWNER_ID fallback removed from getStore()
+// 2. Monday/Tuesday only lock (covers public holidays)
+// 3. 10-second timeout on all callSheetWriter calls
+// 4. Permanent /mark-submitted endpoint
+// 5. /STATUS available to all whitelisted stores
+// 6. Auto-reset every Friday night via Apps Script trigger
 // ============================================================
 
 const express = require('express');
-const fetch = require('node-fetch');
-const app = express();
+const fetch   = require('node-fetch');
+const app     = express();
 app.use(express.json());
 
 const BOT_TOKEN        = process.env.BOT_TOKEN;
@@ -16,7 +21,6 @@ const OWNER_ID         = process.env.OWNER_CHAT_ID || '5766630052';
 const BASE_URL         = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // ── HARDCODED CHAT IDs — NO REGISTRATION REQUIRED ────────────
-// Key: Telegram chat ID, Value: store key
 const knownChatIds = {
   '8649046356': 'village',    // Village Plaza
   '8756511446': 'liguanea',   // Liguanea
@@ -44,17 +48,14 @@ const STORE_ICONS = {
 };
 
 // ── Case conversion rules ─────────────────────────────────────
-const CASE_CONVERSION_ITEMS = [
-  'chicken sausage',
-  'chicken ham sliced'
-];
-const UNITS_PER_CASE = 50;
-const MAX_CASES      = 2;
+const CASE_CONVERSION_ITEMS = ['chicken sausage', 'chicken ham sliced'];
+const UNITS_PER_CASE        = 50;
+const MAX_CASES             = 2;
 
-const sessions  = {};
+const sessions   = {};
 const submissions = {};
-const itemCache = {};
-const processed = new Set();
+const itemCache  = {};
+const processed  = new Set();
 let weekComplete = false;
 const queues     = {};
 const processing = {};
@@ -81,11 +82,18 @@ async function drainQueue(chatId) {
   processing[chatId] = false;
 }
 
-// ── Get store from hardcoded chat ID ──────────────────────────
+// ── FIX 1: No OWNER_ID fallback — only hardcoded chat IDs ────
 function getStore(from, chatId) {
   chatId = String(chatId);
-  if (knownChatIds[chatId]) return knownChatIds[chatId];
-  return null;
+  return knownChatIds[chatId] || null;
+}
+
+// ── FIX 2: Day-of-week lock — Monday or Tuesday only ─────────
+// Jamaica time = UTC - 5
+function isSubmissionDay() {
+  const nowJA    = new Date(Date.now() - 5 * 3600000);
+  const dayOfWeek = nowJA.getUTCDay(); // 0=Sun, 1=Mon, 2=Tue
+  return dayOfWeek === 1 || dayOfWeek === 2;
 }
 
 function todayJA() {
@@ -97,7 +105,6 @@ function pendingStores() {
   return Object.keys(STORE_NAMES).filter(s => !submissions[s]);
 }
 
-// ── Send to Village Plaza + Owner ─────────────────────────────
 async function sendToAll(text) {
   const villageChatId = getChatIdForStore('village');
   if (villageChatId) await send(villageChatId, text);
@@ -150,13 +157,26 @@ async function answerCb(queryId) {
   }).catch(() => {});
 }
 
+// ── FIX 3: 10-second timeout on all SheetWriter calls ────────
 async function callSheetWriter(payload) {
-  const res = await fetch(SHEET_WRITER_URL, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ ...payload, secret: SHEET_SECRET }),
-  });
-  return res.json();
+  const controller = new AbortController();
+  const timeout    = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(SHEET_WRITER_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ ...payload, secret: SHEET_SECRET }),
+      signal:  controller.signal,
+    });
+    return res.json();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return { ok: false, error: 'Request timed out — please try again.' };
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ── Send PDF file to Telegram ─────────────────────────────────
@@ -185,7 +205,7 @@ async function sendPdfToChat(chatId, base64Data, fileName, caption) {
     await fetch(`${BASE_URL}/sendDocument`, {
       method:  'POST',
       headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-      body:    body,
+      body,
     }).catch(e => console.error('sendPdf error:', e));
   } catch (err) {
     console.error('sendPdfToChat error:', err);
@@ -285,10 +305,10 @@ async function handleAnswer(chatId, session, text) {
     store:    session.store,
     type:     type === 'ingredients' ? 'ingredient' : 'drink',
     rowIndex: indexToWrite,
-    value:    value,
+    value,
   });
   if (!result.ok) {
-    await send(chatId, `⚠️ Error saving count: ${result.error}. Please try again.`);
+    await send(chatId, `⚠️ Error saving count: ${result.error}. Please send the number again.`);
     return;
   }
   if (type === 'ingredients') {
@@ -313,12 +333,12 @@ async function handleReviewEdit(chatId, session, text) {
       return;
     }
     const editIndex = session.editing;
-    const result = await callSheetWriter({
+    const result    = await callSheetWriter({
       action:   'writeCount',
       store:    session.store,
       type:     type === 'ingredients' ? 'ingredient' : 'drink',
       rowIndex: editIndex,
-      value:    value,
+      value,
     });
     if (!result.ok) {
       await send(chatId, `⚠️ Error saving: ${result.error}. Try again.`);
@@ -350,11 +370,11 @@ async function handleReviewEdit(chatId, session, text) {
 }
 
 async function finishSubmission(chatId, session) {
-  session.phase    = 'done';
-  sessions[chatId] = session;
-  const store     = session.store;
-  const storeName = STORE_NAMES[store];
-  const icon      = STORE_ICONS[store];
+  session.phase      = 'done';
+  sessions[chatId]   = session;
+  const store        = session.store;
+  const storeName    = STORE_NAMES[store];
+  const icon         = STORE_ICONS[store];
   submissions[store] = true;
 
   await send(chatId,
@@ -537,7 +557,6 @@ function buildOrderMessages(supplier, delivery, dateStr) {
     `Supplier: ${name}\n` +
     `Date: ${dateStr}\n\n`;
 
-  // ── Case conversion for Chicken Sausage & Chicken Ham Sliced ─────────────
   const processedItems = items.map(item => {
     const lowerName       = item.name.toLowerCase();
     const needsConversion = CASE_CONVERSION_ITEMS.some(n => lowerName.includes(n));
@@ -560,7 +579,7 @@ function buildOrderMessages(supplier, delivery, dateStr) {
   });
 
   if (delivery.includes('direct')) {
-    let body       = header + `Please prepare the following order for delivery to each location:\n\n`;
+    let body           = header + `Please prepare the following order for delivery to each location:\n\n`;
     const villageItems = processedItems.filter(i => i.village);
     if (villageItems.length > 0) {
       body += `Village Plaza\n${supplier.addrVillage ? supplier.addrVillage + '\n' : ''}`;
@@ -649,6 +668,8 @@ async function sendMondayPrompt() {
   await send(OWNER_ID, `📋 Monday inventory prompt sent to all 4 stores.`);
 }
 
+// ── ROUTES ────────────────────────────────────────────────────
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -673,6 +694,7 @@ async function handleMessage(msg) {
   const text   = (msg.text || '').trim().toUpperCase();
   const store  = getStore(msg.from, chatId);
 
+  // ── Unauthorised ──────────────────────────────────────────────────────────
   if (!store) {
     const username = msg.from && msg.from.username ? '@' + msg.from.username : 'no username';
     const name     = msg.from && msg.from.first_name ? msg.from.first_name : 'Unknown';
@@ -680,6 +702,26 @@ async function handleMessage(msg) {
       `⚠️ *Unauthorised access attempt*\nName: ${name}\nUsername: ${username}\nChat ID: ${chatId}`
     );
     await send(chatId, `Sorry, you are not authorised to use this bot.`);
+    return;
+  }
+
+  // ── FIX 5: /STATUS available to all whitelisted stores ───────────────────
+  if (text === '/STATUS') {
+    let statusMsg = `📊 *Inventory Status — ${todayJA()}*\n\n`;
+    Object.keys(STORE_NAMES).forEach(s => {
+      statusMsg += (submissions[s] ? '✅' : '⏳') + ' ' + STORE_NAMES[s] + '\n';
+    });
+    await send(chatId, statusMsg);
+    return;
+  }
+
+  // ── FIX 2: Day-of-week lock ───────────────────────────────────────────────
+  if (!isSubmissionDay()) {
+    await send(chatId,
+      `⚠️ Inventory submission is only available on Mondays.\n` +
+      `_(If today is a public holiday, Tuesday is also accepted.)_\n\n` +
+      `See you then! 🍕`
+    );
     return;
   }
 
@@ -730,16 +772,6 @@ async function handleMessage(msg) {
     return;
   }
 
-  // ── /STATUS (owner only) ──────────────────────────────────────────────────
-  if (text === '/STATUS' && chatId === OWNER_ID) {
-    let statusMsg = `📊 *Inventory Status — ${todayJA()}*\n\n`;
-    Object.keys(STORE_NAMES).forEach(s => {
-      statusMsg += (submissions[s] ? '✅' : '⏳') + ' ' + STORE_NAMES[s] + '\n';
-    });
-    await send(chatId, statusMsg);
-    return;
-  }
-
   // ── Normal flow ───────────────────────────────────────────────────────────
   const session = sessions[chatId];
   if (!session || session.phase === 'done') {
@@ -787,13 +819,29 @@ app.get('/prompt', async (req, res) => {
   res.json({ ok: true, message: 'Monday prompt sent' });
 });
 
+// ── FIX 6: Auto-reset endpoint — called by Apps Script every Friday night ────
 app.get('/reset', (req, res) => {
   if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
   Object.keys(submissions).forEach(k => delete submissions[k]);
   Object.keys(sessions).forEach(k   => delete sessions[k]);
   Object.keys(itemCache).forEach(k  => delete itemCache[k]);
   weekComplete = false;
+  console.log('Bot reset at', new Date().toISOString());
   res.send('Reset complete.');
+});
+
+// ── FIX 4: Permanent /mark-submitted endpoint ─────────────────────────────────
+app.get('/mark-submitted', (req, res) => {
+  if (req.query.secret !== SHEET_SECRET) return res.status(403).send('Unauthorised');
+  const store = req.query.store;
+  if (!STORE_NAMES[store]) return res.status(400).send('Unknown store: ' + store);
+  submissions[store] = true;
+  console.log(`Manually marked ${STORE_NAMES[store]} as submitted.`);
+  res.send(
+    `✅ ${STORE_NAMES[store]} marked as submitted.\n` +
+    `Current submissions: ${JSON.stringify(submissions)}\n` +
+    `Pending: ${pendingStores().map(s => STORE_NAMES[s]).join(', ') || 'none'}`
+  );
 });
 
 app.get('/simulate-all-done', async (req, res) => {
